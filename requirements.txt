@@ -1,0 +1,4 @@
+flask
+pandas
+geopy
+requests
