@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 """
-Simple Flask backend for POTA Trip Planner
+Simple Flask backend for POTA Trip Planner - Fixed Version with Proper Time Constraints
 """
 
 from flask import Flask, request, jsonify, render_template_string
@@ -21,7 +21,7 @@ def get_cache_file():
     return "/tmp/pota_parks_cache.csv"
 
 def is_cache_valid():
-    """Check if cache file exists and is less than 5 days old"""
+    """Check if cache file exists and is less than 7 days old"""
     cache_file = get_cache_file()
     if not os.path.exists(cache_file):
         return False
@@ -29,47 +29,35 @@ def is_cache_valid():
     # Check file modification time
     mod_time = os.path.getmtime(cache_file)
     mod_datetime = datetime.fromtimestamp(mod_time)
-    five_days_ago = datetime.now() - timedelta(days=5)
+    seven_days_ago = datetime.now() - timedelta(days=7)
     
-    return mod_datetime > five_days_ago
+    return mod_datetime > seven_days_ago
 
 def load_parks_from_cache():
-    """Load parks from cached CSV file"""
+    """Load parks from cached CSV file or download fresh if needed"""
     try:
         cache_file = get_cache_file()
+        
+        # First, try to load from cache
         if os.path.exists(cache_file) and is_cache_valid():
             df = pd.read_csv(cache_file)
+            print(f"Loaded {len(df)} parks from cache")
             return df
         else:
-            # Update cache if needed
-            df = update_park_database()
+            print("Cache not valid or doesn't exist, downloading fresh data...")
+            # Download the full park database
+            url = "https://pota.app/all_parks_ext.csv"
+            df = pd.read_csv(url)
+            
+            # Save to cache file
+            df.to_csv(cache_file, index=False)
+            print(f"Downloaded and cached {len(df)} parks")
             return df
+            
     except Exception as e:
-        print(f"Error loading cache: {e}")
-        return None
-
-def update_park_database():
-    """Update the local CSV database automatically"""
-    try:
-        print("Updating park database from POTA API...")
-        # Download the full park database
-        url = "https://pota.app/all_parks_ext.csv"
-        df = pd.read_csv(url)
-        
-        # Save to cache file
-        cache_file = get_cache_file()
-        df.to_csv(cache_file, index=False)
-        print(f"Updated park database with {len(df)} parks")
-        return df
-    except Exception as e:
-        print(f"Error updating database: {e}")
-        # If we can't update, try to load existing file
-        if os.path.exists(get_cache_file()):
-            print("Loading existing cached database")
-            return pd.read_csv(get_cache_file())
-        else:
-            print("No existing database available")
-            return None
+        print(f"Error in load_parks_from_cache: {e}")
+        # Return empty DataFrame to prevent crashes, but log the error
+        return pd.DataFrame()
 
 def geocode_city(city_name):
     """Convert city name to lat/lng coordinates"""
@@ -95,6 +83,10 @@ def find_nearby_parks(parks_df, city_coords, max_distance_miles=100, max_hours=N
     """Find parks within specified constraints"""
     nearby_parks = []
     
+    # Check if we have data
+    if parks_df.empty:
+        return []
+    
     # Filter out non-POTA parks and check distances
     for index, park in parks_df.iterrows():
         # Skip non-POTA parks (if any)
@@ -112,36 +104,40 @@ def find_nearby_parks(parks_df, city_coords, max_distance_miles=100, max_hours=N
                 park_coords = (float(park['latitude']), float(park['longitude']))
                 distance = geodesic(city_coords, park_coords).miles
                 
-                # Apply distance filter
-                if distance <= max_distance_miles:
-                    # If there are time or miles constraints, check those too
-                    if max_hours is not None:
-                        # Calculate time to park and back
-                        driving_time = calculate_driving_time(city_coords, park_coords)
-                        # Simplified approach: 2 hours at park + driving time (more generous)
-                        total_time = driving_time + 2  # 2 hours at park + driving time
-                        # Be slightly more generous with the constraint to ensure parks like Purtis Creek show up
-                        if total_time <= max_hours + 0.1:  # Add small buffer
-                            nearby_parks.append((park, distance, total_time))
-                    elif max_miles is not None:
-                        # Check if total round trip is within limits
-                        driving_time = calculate_driving_time(city_coords, park_coords)
-                        round_trip_miles = driving_time * 40  # assuming 40 mph average
-                        if round_trip_miles <= max_miles:
-                            nearby_parks.append((park, distance, round_trip_miles))
-                    else:
-                        # No additional constraints, just distance
+                # Apply constraints
+                if max_hours is not None:
+                    # Calculate time to park and back
+                    driving_time = calculate_driving_time(city_coords, park_coords)
+                    # Time constraint: 2 hours at park + driving time
+                    total_time = driving_time + 2  # 2 hours at park + driving time
+                    
+                    # If this park can be visited within the time limit, add it
+                    if total_time <= max_hours:
+                        nearby_parks.append((park, distance, total_time))
+                elif max_miles is not None:
+                    # Check if total round trip is within limits
+                    driving_time = calculate_driving_time(city_coords, park_coords)
+                    round_trip_miles = driving_time * 40  # assuming 40 mph average
+                    if round_trip_miles <= max_miles:
+                        nearby_parks.append((park, distance, round_trip_miles))
+                elif max_distance_miles is not None:
+                    # Only distance constraint
+                    if distance <= max_distance_miles:
                         nearby_parks.append((park, distance, 0))
     
-    # Sort by distance and return up to 10 nearest
-    nearby_parks.sort(key=lambda x: x[1])
+    # Sort by time (if using time constraint) or distance
+    if max_hours is not None:
+        nearby_parks.sort(key=lambda x: x[2])  # Sort by total time
+    else:
+        nearby_parks.sort(key=lambda x: x[1])  # Sort by distance
+    
     # Return just the parks (not distance/time info)
-    return [park for park, _, _ in nearby_parks[:10]]
+    return [park for park, _, _ in nearby_parks]
 
 def generate_google_maps_url_with_markers(city, parks):
-    """Generate Google Maps URL with park number markers"""
+    """Generate Google Maps URL with park number markers using proper labeling"""
     try:
-        # Create a more sophisticated URL with markers
+        # Create a better URL with proper labeling for each park
         base_url = "https://www.google.com/maps/dir/?api=1"
         
         # Add origin
@@ -151,23 +147,36 @@ def generate_google_maps_url_with_markers(city, parks):
         # Add destination (same as origin for circular route)
         base_url += f"&destination={origin}"
         
-        # Add waypoints with specific park markers
+        # Add waypoints with proper labels for each park
         waypoints = []
+        markers = []
+        
         for i, park in enumerate(parks[:10]):  # Limit to first 10 parks
             if 'latitude' in park and 'longitude' in park:
                 lat = park['latitude']
                 lng = park['longitude']
                 # Format as lat,lng for Google Maps
                 waypoints.append(f"{lat},{lng}")
+                
+                # Add marker for this specific park with label
+                marker_label = str(i + 1)  # Park numbers 1, 2, 3...
+                markers.append(f"markers=label:{marker_label}%7C{lat},{lng}")
         
         if waypoints:
             waypoints_str = '|'.join(waypoints)
             base_url += f"&waypoints={waypoints_str}"
         
+        # Add markers to the URL
+        if markers:
+            markers_str = '|'.join(markers)
+            base_url += f"&map_action=overlay&overlay={markers_str}"
+        
+        print(f"Generated Google Maps URL: {base_url}")
         return base_url
+        
     except Exception as e:
         print(f"Error generating Google Maps URL with markers: {e}")
-        return None
+        return "https://www.google.com/maps"
 
 # HTML template for the main page with enhanced UI
 HTML_TEMPLATE = '''
@@ -366,6 +375,11 @@ HTML_TEMPLATE = '''
             color: #155724;
             border-left: 5px solid var(--accent-color-3);
             animation: fadeIn 0.5s;
+        }
+        
+        .result h2 {
+            color: var(--text-color);
+            margin-top: 0;
         }
         
         .result .park-name {
@@ -697,6 +711,12 @@ HTML_TEMPLATE = '''
         document.getElementById('tripForm').addEventListener('submit', function(e) {
             e.preventDefault();
             
+            // Clear previous results
+            const resultDiv = document.getElementById('result');
+            const resultContent = document.getElementById('resultContent');
+            resultContent.innerHTML = '';
+            resultDiv.style.display = 'none';
+            
             const formData = new FormData(this);
             const data = {};
             for (let [key, value] of formData.entries()) {
@@ -719,9 +739,13 @@ HTML_TEMPLATE = '''
                 },
                 body: JSON.stringify(data)
             })
-            .then(response => response.json())
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                return response.json();
+            })
             .then(result => {
-                const resultDiv = document.getElementById('result');
                 const resultCity = document.getElementById('resultCity');
                 const resultContent = document.getElementById('resultContent');
                 const mapsLink = document.getElementById('mapsLink');
@@ -755,7 +779,6 @@ HTML_TEMPLATE = '''
                 }
             })
             .catch(error => {
-                const resultDiv = document.getElementById('result');
                 const resultContent = document.getElementById('resultContent');
                 resultContent.innerHTML = `<div class="error">Network error: ${error.message}</div>`;
                 resultDiv.style.display = 'block';
@@ -807,13 +830,13 @@ def plan_trip():
         
         # Load parks
         parks_df = load_parks_from_cache()
-        if parks_df is None:
-            return jsonify({'error': 'Could not load park data'}), 500
+        if parks_df.empty:
+            return jsonify({'error': 'Could not load park data. Please try again later.'}), 500
         
         # Geocode city
         city_coords = geocode_city(city)
         if not city_coords:
-            return jsonify({'error': 'Could not find city coordinates'}), 400
+            return jsonify({'error': 'Could not find city coordinates. Please check the city name and try again.'}), 400
         
         # Find nearby parks with constraints
         nearby_parks = find_nearby_parks(parks_df, city_coords, radius_value, hours_value, miles_value)
@@ -855,11 +878,13 @@ def plan_trip():
         return jsonify(response_data)
         
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': f'Application error: {str(e)}'}), 500
 
 if __name__ == '__main__':
-    # Make sure we have the database cached
-    load_parks_from_cache()
+    # Initialize cache on startup
+    print("Initializing POTA Trip Planner...")
+    parks_df = load_parks_from_cache()
+    print(f"Loaded {len(parks_df)} parks from cache")
     print("Starting POTA Trip Planner server...")
     print("Visit http://localhost:5001 to use the application")
     app.run(host='0.0.0.0', port=5001, debug=True)
