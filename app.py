@@ -1,16 +1,28 @@
 #!/usr/bin/python3
 """
-Simple Flask backend for POTA Trip Planner - Fixed Version with Proper Time Constraints
+Complete Flask backend for POTA Trip Planner with proper time constraint algorithm
 """
-
 from flask import Flask, request, jsonify, render_template_string
 import pandas as pd
 import sys
 import os
+import logging
 from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
 import requests
 from datetime import datetime, timedelta
+import json
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('/tmp/pota_trip_log.txt'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # Create Flask app
 app = Flask(__name__)
@@ -41,23 +53,31 @@ def load_parks_from_cache():
         # First, try to load from cache
         if os.path.exists(cache_file) and is_cache_valid():
             df = pd.read_csv(cache_file)
-            print(f"Loaded {len(df)} parks from cache")
+            logger.info(f"Loaded {len(df)} parks from cache")
             return df
         else:
-            print("Cache not valid or doesn't exist, downloading fresh data...")
+            logger.info("Cache not valid or doesn't exist, downloading fresh data...")
             # Download the full park database
             url = "https://pota.app/all_parks_ext.csv"
             df = pd.read_csv(url)
             
             # Save to cache file
             df.to_csv(cache_file, index=False)
-            print(f"Downloaded and cached {len(df)} parks")
+            logger.info(f"Downloaded and cached {len(df)} parks")
             return df
             
     except Exception as e:
-        print(f"Error in load_parks_from_cache: {e}")
-        # Return empty DataFrame to prevent crashes, but log the error
-        return pd.DataFrame()
+        logger.error(f"Error in load_parks_from_cache: {e}")
+        # Try to load cached data even if it's old or corrupted
+        try:
+            if os.path.exists(cache_file):
+                df = pd.read_csv(cache_file)
+                logger.info(f"Loaded {len(df)} parks from stale cache")
+                return df
+        except Exception as e2:
+            logger.error(f"Error loading stale cache: {e2}")
+            # Return empty DataFrame to prevent crashes, but log the error
+            return pd.DataFrame()
 
 def geocode_city(city_name):
     """Convert city name to lat/lng coordinates"""
@@ -69,7 +89,7 @@ def geocode_city(city_name):
         else:
             return None
     except Exception as e:
-        print(f"Error geocoding city: {e}")
+        logger.error(f"Error geocoding city: {e}")
         return None
 
 def calculate_driving_time(point1, point2):
@@ -132,7 +152,37 @@ def find_nearby_parks(parks_df, city_coords, max_distance_miles=100, max_hours=N
         nearby_parks.sort(key=lambda x: x[1])  # Sort by distance
     
     # Return just the parks (not distance/time info)
-    return [park for park, _, _ in nearby_parks]
+    result_parks = [park for park, _, _ in nearby_parks]
+    
+    # Log selected parks for debugging (only when time constraint is used)
+    if max_hours is not None and len(result_parks) > 0:
+        logger.info(f"\n=== SELECTED PARKS FOR {max_hours} HOUR CONSTRAINT ===")
+        # Only show first 10 for brevity, but show the actual count
+        for i, park in enumerate(result_parks[:10]):  # Show top 10 only
+            name = park.get('name', 'Unknown')
+            logger.info(f"{i+1}. {name}")
+        logger.info(f"Total parks selected: {len(result_parks)}")
+        logger.info("==========================================\n")
+    
+    return result_parks
+
+def calculate_total_trip_time(parks, city_coords):
+    """Calculate the total time for a trip including travel between parks"""
+    if len(parks) <= 1:
+        return 0
+    
+    total_time = 0
+    current_coords = city_coords
+    
+    # For each park, calculate travel time and add 2 hours for visit
+    for park in parks:
+        if 'latitude' in park and 'longitude' in park:
+            park_coords = (float(park['latitude']), float(park['longitude']))
+            driving_time = calculate_driving_time(current_coords, park_coords)
+            total_time += driving_time + 2  # 2 hours at park
+            current_coords = park_coords
+    
+    return total_time
 
 def generate_google_maps_url_with_markers(city, parks):
     """Generate Google Maps URL with park number markers using proper labeling"""
@@ -171,12 +221,67 @@ def generate_google_maps_url_with_markers(city, parks):
             markers_str = '|'.join(markers)
             base_url += f"&map_action=overlay&overlay={markers_str}"
         
-        print(f"Generated Google Maps URL: {base_url}")
+        logger.info(f"Generated Google Maps URL: {base_url}")
         return base_url
         
     except Exception as e:
-        print(f"Error generating Google Maps URL with markers: {e}")
+        logger.error(f"Error generating Google Maps URL with markers: {e}")
         return "https://www.google.com/maps"
+
+def generate_optimized_trip(parks, city_coords, max_hours=None, max_miles=None):
+    """
+    Generate an optimized trip that visits parks in logical order.
+    This implements the core logic for the trip planner.
+    """
+    if not parks:
+        return []
+    
+    # For the time constraint, we'll select parks that fit within the time limit
+    # and return them in the order they were found (sorted by time)
+    if max_hours is not None:
+        # The parks are already sorted by time, so we'll select parks
+        # that fit within the time limit by adding them one by one
+        selected_parks = []
+        current_coords = city_coords
+        total_time = 0
+        
+        for park in parks:
+            if 'latitude' in park and 'longitude' in park:
+                park_coords = (float(park['latitude']), float(park['longitude']))
+                driving_time = calculate_driving_time(current_coords, park_coords)
+                total_time += driving_time + 2  # 2 hours at park
+                
+                if total_time <= max_hours:
+                    selected_parks.append(park)
+                    current_coords = park_coords
+                else:
+                    break  # We've exceeded the time limit
+        return selected_parks
+    
+    # For miles constraint, we'll sort by distance and take parks within limit
+    if max_miles is not None:
+        # This is a simplification - in a real implementation we'd need to 
+        # optimize the route to minimize total distance, but for this implementation
+        # we'll just return parks that fit within the limit
+        selected_parks = []
+        total_distance = 0
+        
+        for park in parks:
+            if 'latitude' in park and 'longitude' in park:
+                park_coords = (float(park['latitude']), float(park['longitude']))
+                distance = geodesic(city_coords, park_coords).miles
+                round_trip = distance * 2  # Round trip
+                
+                if total_distance + round_trip <= max_miles:
+                    selected_parks.append(park)
+                    total_distance += round_trip
+                else:
+                    break  # We've exceeded the distance limit
+                    
+        return selected_parks
+    
+    # For radius constraint, return all parks within radius
+    return parks
 
 # HTML template for the main page with enhanced UI
 HTML_TEMPLATE = '''
@@ -242,7 +347,7 @@ HTML_TEMPLATE = '''
             background-position: center;
             background-attachment: fixed;
         }
-        
+
         .container {
             display: flex;
             background-color: var(--container-bg);
@@ -252,7 +357,7 @@ HTML_TEMPLATE = '''
             transition: background-color 0.3s, color 0.3s;
             backdrop-filter: blur(10px);
         }
-        
+
         .sidebar {
             width: 250px;
             background: var(--sidebar-bg);
@@ -260,12 +365,12 @@ HTML_TEMPLATE = '''
             padding: 25px;
             height: fit-content;
         }
-        
+
         .main-content {
             flex: 1;
             padding: 30px;
         }
-        
+
         .title-container {
             text-align: center;
             margin-bottom: 30px;
@@ -275,60 +380,60 @@ HTML_TEMPLATE = '''
             box-shadow: 0 4px 15px rgba(0,0,0,0.1);
             animation: pulse 2s infinite;
         }
-        
+
         @keyframes pulse {
             0% { box-shadow: 0 0 0 0 rgba(231, 76, 60, 0.4); }
             70% { box-shadow: 0 0 0 10px rgba(231, 76, 60, 0); }
             100% { box-shadow: 0 0 0 0 rgba(231, 76, 60, 0); }
         }
-        
+
         h1 {
             color: white;
             margin: 0;
             font-size: 2.5em;
             text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
         }
-        
+
         .subtitle {
             color: rgba(255, 255, 255, 0.9);
             font-size: 1.2em;
             margin-top: 5px;
         }
-        
+
         .instructions {
             background-color: rgba(255, 255, 255, 0.1);
             border-radius: 8px;
             padding: 15px;
             margin-bottom: 20px;
         }
-        
+
         .instructions h3 {
             margin-top: 0;
             color: white;
             border-bottom: 1px solid rgba(255, 255, 255, 0.3);
             padding-bottom: 8px;
         }
-        
+
         .instructions ul {
             padding-left: 20px;
         }
-        
+
         .instructions li {
             margin-bottom: 10px;
             line-height: 1.4;
         }
-        
+
         .form-group {
             margin-bottom: 20px;
         }
-        
+
         label {
             display: block;
             margin-bottom: 8px;
             font-weight: 600;
             color: var(--header-color);
         }
-        
+
         input[type="text"], input[type="number"], select {
             width: 100%;
             padding: 12px;
@@ -340,13 +445,13 @@ HTML_TEMPLATE = '''
             font-size: 16px;
             transition: border-color 0.3s, box-shadow 0.3s;
         }
-        
+
         input[type="text"]:focus, input[type="number"]:focus, select:focus {
             border-color: var(--accent-color-2);
             box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.2);
             outline: none;
         }
-        
+
         button {
             background: linear-gradient(90deg, var(--button-bg), #3a6be0);
             color: white;
@@ -360,12 +465,12 @@ HTML_TEMPLATE = '''
             transition: all 0.3s ease;
             box-shadow: 0 4px 15px rgba(44, 90, 160, 0.3);
         }
-        
+
         button:hover {
             transform: translateY(-2px);
             box-shadow: 0 6px 20px rgba(44, 90, 160, 0.4);
         }
-        
+
         .result {
             margin-top: 30px;
             padding: 25px;
@@ -376,29 +481,29 @@ HTML_TEMPLATE = '''
             border-left: 5px solid var(--accent-color-3);
             animation: fadeIn 0.5s;
         }
-        
+
         .result h2 {
             color: var(--text-color);
             margin-top: 0;
         }
-        
+
         .result .park-name {
             color: var(--text-color);
         }
-        
+
         .result .park-reference {
             color: var(--accent-color-2);
         }
-        
+
         .result .park-number {
             color: var(--accent-color-3);
         }
-        
+
         .result .park-distance {
             background-color: var(--accent-color-1);
             color: white;
         }
-        
+
         .result .error {
             color: #721c24;
             background-color: var(--error-bg);
@@ -407,28 +512,28 @@ HTML_TEMPLATE = '''
             padding: 15px;
             margin-top: 15px;
         }
-        
+
         .dark-mode .result .error {
             color: #721c24;
             background-color: var(--error-bg);
             border-left-color: var(--accent-color-1);
         }
-        
+
         @keyframes fadeIn {
             from { opacity: 0; transform: translateY(10px); }
             to { opacity: 1; transform: translateY(0); }
         }
-        
+
         .error {
             background-color: var(--error-bg);
             color: #721c24;
             border-left-color: var(--accent-color-1);
         }
-        
+
         .park-list {
             margin-top: 20px;
         }
-        
+
         .park-item {
             padding: 15px;
             margin: 10px 0;
@@ -440,34 +545,34 @@ HTML_TEMPLATE = '''
             transition: transform 0.2s, box-shadow 0.2s;
             border-left: 4px solid var(--accent-color-3);
         }
-        
+
         .park-item:hover {
             transform: translateX(5px);
             box-shadow: 0 4px 10px rgba(0,0,0,0.1);
         }
-        
+
         .park-info {
             flex: 1;
         }
-        
+
         .park-number {
             font-weight: bold;
             color: var(--accent-color-3);
             font-size: 1.2em;
             margin-right: 10px;
         }
-        
+
         .park-name {
             font-weight: 600;
             font-size: 1.1em;
             color: var(--text-color);
         }
-        
+
         .park-reference {
             color: var(--accent-color-2);
             font-weight: 500;
         }
-        
+
         .park-distance {
             background-color: var(--accent-color-1);
             color: white;
@@ -475,7 +580,7 @@ HTML_TEMPLATE = '''
             border-radius: 20px;
             font-weight: 600;
         }
-        
+
         .google-maps-link {
             display: block;
             margin-top: 20px;
@@ -489,12 +594,12 @@ HTML_TEMPLATE = '''
             transition: all 0.3s ease;
             box-shadow: 0 4px 15px rgba(52, 152, 219, 0.3);
         }
-        
+
         .google-maps-link:hover {
             transform: translateY(-2px);
             box-shadow: 0 6px 20px rgba(52, 152, 219, 0.4);
         }
-        
+
         .dark-mode-toggle {
             position: absolute;
             top: 20px;
@@ -511,11 +616,11 @@ HTML_TEMPLATE = '''
             transition: all 0.3s ease;
             box-shadow: 0 4px 15px rgba(0,0,0,0.2);
         }
-        
+
         .dark-mode-toggle:hover {
             background-color: var(--button-hover);
         }
-        
+
         .park-number-marker {
             display: inline-block;
             width: 24px;
@@ -529,16 +634,16 @@ HTML_TEMPLATE = '''
             font-weight: bold;
             margin-right: 10px;
         }
-        
+
         .park-item {
             display: flex;
             align-items: center;
         }
-        
+
         .park-item .park-info {
             flex: 1;
         }
-        
+
         .park-item .park-distance {
             margin-left: 15px;
         }
@@ -828,6 +933,9 @@ def plan_trip():
         except (ValueError, TypeError):
             miles_value = None
         
+        # Log the request parameters
+        logger.info(f"Planning trip for {city}, {state} with constraints: radius={radius_value}, hours={hours_value}, miles={miles_value}")
+        
         # Load parks
         parks_df = load_parks_from_cache()
         if parks_df.empty:
@@ -840,6 +948,13 @@ def plan_trip():
         
         # Find nearby parks with constraints
         nearby_parks = find_nearby_parks(parks_df, city_coords, radius_value, hours_value, miles_value)
+        
+        # Optimize the trip based on constraints
+        if hours_value or miles_value:
+            optimized_parks = generate_optimized_trip(nearby_parks, city_coords, hours_value, miles_value)
+            # If we have optimized parks, use them instead of the raw filtered parks
+            if optimized_parks:
+                nearby_parks = optimized_parks
         if not nearby_parks:
             if hours_value:
                 return jsonify({'error': f'No parks found within {hours_value} hours'}), 404
@@ -875,16 +990,23 @@ def plan_trip():
             'googleMapsUrl': google_maps_url
         }
         
+        # Log the successful request
+        logger.info(f"Successfully planned trip with {len(parks_data)} parks for {city}")
+        
         return jsonify(response_data)
         
     except Exception as e:
+        # Log the full error for debugging
+        logger.error(f"Application error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': f'Application error: {str(e)}'}), 500
 
 if __name__ == '__main__':
     # Initialize cache on startup
-    print("Initializing POTA Trip Planner...")
+    logger.info("Initializing POTA Trip Planner...")
     parks_df = load_parks_from_cache()
-    print(f"Loaded {len(parks_df)} parks from cache")
-    print("Starting POTA Trip Planner server...")
-    print("Visit http://localhost:5001 to use the application")
+    logger.info(f"Loaded {len(parks_df)} parks from cache")
+    logger.info("Starting POTA Trip Planner server...")
+    logger.info("Visit http://localhost:5001 to use the application")
     app.run(host='0.0.0.0', port=5001, debug=True)
