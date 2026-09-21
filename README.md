@@ -13,6 +13,14 @@ A web application for planning ham radio park visiting trips using the POTA (Par
 - **Google Maps Integration**: Embedded links to trip planning
 - **Error Handling**: Proper validation to prevent "Could not convert string to float" errors
 
+## Project Structure
+
+This project follows a clean structure:
+- `app.py` - Main web application
+- `index.html` - Web interface
+- `tests/` - Test cases and debugging tools
+- `docs/` - Documentation
+
 ## Installation
 
 1. Install required packages:
@@ -34,33 +42,35 @@ A web application for planning ham radio park visiting trips using the POTA (Par
 3. Set at least one constraint (Radius, Hours, or Miles)
 4. Click "Plan My Trip"
 
-## Example Usage
-
-### Using Hours Constraint:
-- City: "Eustace" 
-- State: "US-TX"
-- Hours: "4"
-- This will find parks that can be visited within 4 hours total (including travel and 2 hours at each park)
-
-### Using Radius Constraint:
-- City: "Dallas"
-- State: "US-TX"
-- Radius: "50"
-- This will find parks within 50 miles of Dallas
-
-### Using Miles Constraint:
-- City: "Austin"
-- State: "US-TX"
-- Miles: "200"
-- This will find parks with round-trip distances under 200 miles
-
 ## Technical Details
 
-- Uses the official POTA database from `https://pota.app/all_parks_ext.csv`
-- Automatically caches data in `/tmp/pota_parks_cache.csv`
-- Filters out non-POTA parks (like "State Park Store")
-- Shows park reference numbers (e.g., US-4423, US-6547)
-- Includes Google Maps integration for trip planning
+1. Database Management System:
+   - Weekly recreation of the parks database from pota.app
+   - Caching mechanism that maintains database for up to a week
+   - Automatic database refresh when older than 7 days
+   - Proper cache file management
+
+2. Web Interface:
+   - Complete Flask web application with responsive UI
+   - City input with state/province selection
+   - Multiple constraint options (radius, hours, miles)
+   - Google Maps integration with park markers
+   - Dark/light mode toggle
+
+3. Trip Planning Algorithms:
+   - Radius filtering: Parks within specified distance
+   - Hours filtering: Parks that can be visited within time constraints (2 hours at each park + driving time)
+   - Miles filtering: Parks within specified round-trip distance limits
+
+4. Logging & Debugging:
+   - Comprehensive logging of user inputs and trip data
+   - Server-side logging to /tmp/pota_trip_log.txt
+   - Detailed debugging information
+
+5. Test Coverage:
+   - All three constraint algorithms thoroughly tested
+   - Test cases for radius, hours, and miles constraints
+   - Verification that algorithms work correctly in the main program
 
 ## Error Handling
 

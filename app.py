@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 """
 Complete Flask backend for POTA Trip Planner with proper time constraint algorithm
+Based on working algorithm from HoursTrip/pota_final_trip.py
 """
 from flask import Flask, request, jsonify, render_template_string
 import pandas as pd
@@ -107,64 +108,140 @@ def find_nearby_parks(parks_df, city_coords, max_distance_miles=100, max_hours=N
     if parks_df.empty:
         return []
     
-    # Filter out non-POTA parks and check distances
-    for index, park in parks_df.iterrows():
-        # Skip non-POTA parks (if any)
-        if 'name' in park and ('State Park' in str(park['name']) or 'State Park Store' in str(park['name'])):
-            continue
+    # Apply distance constraint first to reduce the dataset
+    if max_distance_miles is not None and max_distance_miles > 0:
+        # Filter by radius first
+        filtered_parks = []
+        for index, park in parks_df.iterrows():
+            if 'latitude' in park and 'longitude' in park:
+                if not pd.isna(park['latitude']) and not pd.isna(park['longitude']):
+                    try:
+                        # Safely extract coordinates as scalars
+                        lat = float(park['latitude'])
+                        lon = float(park['longitude'])
+                        park_coords = (lat, lon)
+                        
+                        distance = geodesic(city_coords, park_coords).miles
+                        
+                        # If this park is within the distance constraint, add it
+                        if distance <= max_distance_miles:
+                            park['distance_miles'] = distance
+                            filtered_parks.append(park)
+                    except Exception as e:
+                        # Skip invalid coordinates
+                        continue
+        
+        # Sort by distance (nearest to farthest)
+        filtered_parks.sort(key=lambda x: x.get('distance_miles', 0))
+        
+        # Now apply time or distance constraints to filtered list
+        if max_hours is not None and max_hours > 0:
+            # Apply time constraint
+            for park in filtered_parks:
+                if 'latitude' in park and 'longitude' in park:
+                    try:
+                        # Safely extract coordinates as scalars
+                        lat = float(park['latitude'])
+                        lon = float(park['longitude'])
+                        park_coords = (lat, lon)
+                        
+                        # Calculate time to park
+                        driving_time = calculate_driving_time(city_coords, park_coords)
+                        # Time constraint: 2 hours at park + driving time
+                        total_time = driving_time + 2  # 2 hours at park + driving time
+                        
+                        # If this park can be visited within the time limit, add it
+                        if total_time <= max_hours:
+                            nearby_parks.append(park)
+                    except Exception as e:
+                        # Skip invalid coordinates
+                        continue
+                        
+        elif max_miles is not None and max_miles > 0:
+            # Apply miles constraint
+            for park in filtered_parks:
+                if 'latitude' in park and 'longitude' in park:
+                    try:
+                        # Safely extract coordinates as scalars
+                        lat = float(park['latitude'])
+                        lon = float(park['longitude'])
+                        park_coords = (lat, lon)
+                        
+                        # Calculate round trip distance
+                        driving_time = calculate_driving_time(city_coords, park_coords)
+                        round_trip_miles = driving_time * 40  # assuming 40 mph average
+                        
+                        # If this park fits within the miles constraint, add it
+                        if round_trip_miles <= max_miles:
+                            nearby_parks.append(park)
+                    except Exception as e:
+                        # Skip invalid coordinates
+                        continue
+        else:
+            # No time or distance constraint, return filtered parks
+            nearby_parks = filtered_parks
             
-        # Check if we have the coordinates
-        if 'latitude' in park and 'longitude' in park:
-            # Handle potential NaN values
-            if pd.isna(park['latitude']) or pd.isna(park['longitude']):
-                continue
-                
-            # Ensure latitude is within valid range
-            if -90 <= float(park['latitude']) <= 90:
-                park_coords = (float(park['latitude']), float(park['longitude']))
-                distance = geodesic(city_coords, park_coords).miles
-                
-                # Apply constraints
-                if max_hours is not None:
-                    # Calculate time to park and back
-                    driving_time = calculate_driving_time(city_coords, park_coords)
-                    # Time constraint: 2 hours at park + driving time
-                    total_time = driving_time + 2  # 2 hours at park + driving time
-                    
-                    # If this park can be visited within the time limit, add it
-                    if total_time <= max_hours:
-                        nearby_parks.append((park, distance, total_time))
-                elif max_miles is not None:
-                    # Check if total round trip is within limits
-                    driving_time = calculate_driving_time(city_coords, park_coords)
-                    round_trip_miles = driving_time * 40  # assuming 40 mph average
-                    if round_trip_miles <= max_miles:
-                        nearby_parks.append((park, distance, round_trip_miles))
-                elif max_distance_miles is not None:
-                    # Only distance constraint
-                    if distance <= max_distance_miles:
-                        nearby_parks.append((park, distance, 0))
-    
-    # Sort by time (if using time constraint) or distance
-    if max_hours is not None:
-        nearby_parks.sort(key=lambda x: x[2])  # Sort by total time
     else:
-        nearby_parks.sort(key=lambda x: x[1])  # Sort by distance
-    
-    # Return just the parks (not distance/time info)
-    result_parks = [park for park, _, _ in nearby_parks]
+        # No radius constraint, apply time or distance constraints directly
+        if max_hours is not None and max_hours > 0:
+            # Apply time constraint to all parks
+            for index, park in parks_df.iterrows():
+                if 'latitude' in park and 'longitude' in park:
+                    if not pd.isna(park['latitude']) and not pd.isna(park['longitude']):
+                        try:
+                            # Safely extract coordinates as scalars
+                            lat = float(park['latitude'])
+                            lon = float(park['longitude'])
+                            park_coords = (lat, lon)
+                            
+                            # Calculate time to park
+                            driving_time = calculate_driving_time(city_coords, park_coords)
+                            # Time constraint: 2 hours at park + driving time
+                            total_time = driving_time + 2  # 2 hours at park + driving time
+                            
+                            # If this park can be visited within the time limit, add it
+                            if total_time <= max_hours:
+                                nearby_parks.append(park)
+                        except Exception as e:
+                            # Skip invalid coordinates
+                            continue
+                            
+        elif max_miles is not None and max_miles > 0:
+            # Apply miles constraint to all parks
+            for index, park in parks_df.iterrows():
+                if 'latitude' in park and 'longitude' in park:
+                    if not pd.isna(park['latitude']) and not pd.isna(park['longitude']):
+                        try:
+                            # Safely extract coordinates as scalars
+                            lat = float(park['latitude'])
+                            lon = float(park['longitude'])
+                            park_coords = (lat, lon)
+                            
+                            # Calculate round trip distance
+                            driving_time = calculate_driving_time(city_coords, park_coords)
+                            round_trip_miles = driving_time * 40  # assuming 40 mph average
+                            
+                            # If this park fits within the miles constraint, add it
+                            if round_trip_miles <= max_miles:
+                                nearby_parks.append(park)
+                        except Exception as e:
+                            # Skip invalid coordinates
+                            continue
+        else:
+            # No constraints, return all parks
+            nearby_parks = parks_df.to_dict('records')
     
     # Log selected parks for debugging (only when time constraint is used)
-    if max_hours is not None and len(result_parks) > 0:
+    if max_hours is not None and len(nearby_parks) > 0:
         logger.info(f"\n=== SELECTED PARKS FOR {max_hours} HOUR CONSTRAINT ===")
         # Only show first 10 for brevity, but show the actual count
-        for i, park in enumerate(result_parks[:10]):  # Show top 10 only
+        for i, park in enumerate(nearby_parks[:10]):  # Show top 10 only
             name = park.get('name', 'Unknown')
             logger.info(f"{i+1}. {name}")
-        logger.info(f"Total parks selected: {len(result_parks)}")
+        logger.info(f"Total parks selected: {len(nearby_parks)}")
         logger.info("==========================================\n")
     
-    return result_parks
+    return nearby_parks
 
 def calculate_total_trip_time(parks, city_coords):
     """Calculate the total time for a trip including travel between parks"""
@@ -236,48 +313,52 @@ def generate_optimized_trip(parks, city_coords, max_hours=None, max_miles=None):
     if not parks:
         return []
     
-    # For the time constraint, we'll select parks that fit within the time limit
-    # and return them in the order they were found (sorted by time)
+    # For time constraint, we want to build a trip that fits within the time limit
     if max_hours is not None:
-        # The parks are already sorted by time, so we'll select parks
-        # that fit within the time limit by adding them one by one
+        # We'll build a trip by adding parks one by one until we exceed the time limit
         selected_parks = []
         current_coords = city_coords
         total_time = 0
         
+        # Sort parks by distance to start (nearest first) for better route optimization
+        # But we'll need to be careful about the actual time constraints
         for park in parks:
             if 'latitude' in park and 'longitude' in park:
-                park_coords = (float(park['latitude']), float(park['longitude']))
-                driving_time = calculate_driving_time(current_coords, park_coords)
-                total_time += driving_time + 2  # 2 hours at park
-                
-                if total_time <= max_hours:
-                    selected_parks.append(park)
-                    current_coords = park_coords
-                else:
-                    break  # We've exceeded the time limit
+                try:
+                    park_coords = (float(park['latitude']), float(park['longitude']))
+                    driving_time = calculate_driving_time(current_coords, park_coords)
+                    total_time += driving_time + 2  # 2 hours at park
+                    
+                    if total_time <= max_hours:
+                        selected_parks.append(park)
+                        current_coords = park_coords
+                    else:
+                        break  # We've exceeded the time limit
+                except Exception as e:
+                    # Skip invalid coordinates
+                    continue
         return selected_parks
     
-    # For miles constraint, we'll sort by distance and take parks within limit
+    # For miles constraint, we'll just return the first N parks that fit within the distance limit
     if max_miles is not None:
-        # This is a simplification - in a real implementation we'd need to 
-        # optimize the route to minimize total distance, but for this implementation
-        # we'll just return parks that fit within the limit
         selected_parks = []
         total_distance = 0
         
         for park in parks:
             if 'latitude' in park and 'longitude' in park:
-                park_coords = (float(park['latitude']), float(park['longitude']))
-                distance = geodesic(city_coords, park_coords).miles
-                round_trip = distance * 2  # Round trip
-                
-                if total_distance + round_trip <= max_miles:
-                    selected_parks.append(park)
-                    total_distance += round_trip
-                else:
-                    break  # We've exceeded the distance limit
+                try:
+                    park_coords = (float(park['latitude']), float(park['longitude']))
+                    distance = geodesic(city_coords, park_coords).miles
+                    round_trip = distance * 2  # Round trip
                     
+                    if total_distance + round_trip <= max_miles:
+                        selected_parks.append(park)
+                        total_distance += round_trip
+                    else:
+                        break  # We've exceeded the distance limit
+                except Exception as e:
+                    # Skip invalid coordinates
+                    continue
         return selected_parks
     
     # For radius constraint, return all parks within radius
@@ -947,12 +1028,22 @@ def plan_trip():
             return jsonify({'error': 'Could not find city coordinates. Please check the city name and try again.'}), 400
         
         # Find nearby parks with constraints
-        nearby_parks = find_nearby_parks(parks_df, city_coords, radius_value, hours_value, miles_value)
+        if hours_value:
+            nearby_parks = find_nearby_parks(parks_df, city_coords, max_hours=hours_value)
+        elif miles_value:
+            nearby_parks = find_nearby_parks(parks_df, city_coords, max_miles=miles_value)
+        elif radius_value:
+            nearby_parks = find_nearby_parks(parks_df, city_coords, max_distance_miles=radius_value)
+        else:
+            nearby_parks = find_nearby_parks(parks_df, city_coords)
         
         # Optimize the trip based on constraints
-        if hours_value or miles_value:
-            optimized_parks = generate_optimized_trip(nearby_parks, city_coords, hours_value, miles_value)
-            # If we have optimized parks, use them instead of the raw filtered parks
+        if hours_value:
+            optimized_parks = generate_optimized_trip(nearby_parks, city_coords, max_hours=hours_value)
+            if optimized_parks:
+                nearby_parks = optimized_parks
+        elif miles_value:
+            optimized_parks = generate_optimized_trip(nearby_parks, city_coords, max_miles=miles_value)
             if optimized_parks:
                 nearby_parks = optimized_parks
         if not nearby_parks:
