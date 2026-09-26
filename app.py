@@ -80,14 +80,27 @@ def load_parks_from_cache():
             # Return empty DataFrame to prevent crashes, but log the error
             return pd.DataFrame()
 
-def geocode_city(city_name):
-    """Convert city name to lat/lng coordinates"""
+def geocode_city(city_name, state_or_province=None, country=None):
+    """
+    Convert city name to lat/lng coordinates with international support
+    Works with city, state/province, country format
+    """
     try:
+        # Build full location string for geocoding
+        location_string = city_name
+        if state_or_province:
+            location_string += f", {state_or_province}"
+        if country:
+            location_string += f", {country}"
+            
+        # Use Nominatim geocoder (OpenStreetMap)
         geolocator = Nominatim(user_agent="potatrip")
-        location = geolocator.geocode(city_name)
+        location = geolocator.geocode(location_string)
+        
         if location:
             return (location.latitude, location.longitude)
         else:
+            logger.warning(f"Could not geocode location: {location_string}")
             return None
     except Exception as e:
         logger.error(f"Error geocoding city: {e}")
@@ -136,7 +149,7 @@ def find_nearby_parks(parks_df, city_coords, max_distance_miles=100, max_hours=N
         
         # Now apply time or distance constraints to filtered list
         if max_hours is not None and max_hours > 0:
-            # Apply time constraint
+            # Apply time constraint - prioritize by time (shorter trip times first)
             for park in filtered_parks:
                 if 'latitude' in park and 'longitude' in park:
                     try:
@@ -158,7 +171,7 @@ def find_nearby_parks(parks_df, city_coords, max_distance_miles=100, max_hours=N
                         continue
                         
         elif max_miles is not None and max_miles > 0:
-            # Apply miles constraint
+            # Apply miles constraint - prioritize by distance (shorter round trips first)
             for park in filtered_parks:
                 if 'latitude' in park and 'longitude' in park:
                     try:
@@ -321,8 +334,10 @@ def generate_optimized_trip(parks, city_coords, max_hours=None, max_miles=None):
         total_time = 0
         
         # Sort parks by distance to start (nearest first) for better route optimization
-        # But we'll need to be careful about the actual time constraints
-        for park in parks:
+        sorted_parks = sorted(parks, key=lambda x: x.get('distance_miles', 0))
+        
+        # Add parks to trip one by one until time limit is reached
+        for park in sorted_parks:
             if 'latitude' in park and 'longitude' in park:
                 try:
                     park_coords = (float(park['latitude']), float(park['longitude']))
@@ -344,7 +359,10 @@ def generate_optimized_trip(parks, city_coords, max_hours=None, max_miles=None):
         selected_parks = []
         total_distance = 0
         
-        for park in parks:
+        # Sort parks by distance to start (nearest first) for better route optimization
+        sorted_parks = sorted(parks, key=lambda x: x.get('distance_miles', 0))
+        
+        for park in sorted_parks:
             if 'latitude' in park and 'longitude' in park:
                 try:
                     park_coords = (float(park['latitude']), float(park['longitude']))
@@ -1023,7 +1041,7 @@ def plan_trip():
             return jsonify({'error': 'Could not load park data. Please try again later.'}), 500
         
         # Geocode city
-        city_coords = geocode_city(city)
+        city_coords = geocode_city(city, state)
         if not city_coords:
             return jsonify({'error': 'Could not find city coordinates. Please check the city name and try again.'}), 400
         
@@ -1046,13 +1064,7 @@ def plan_trip():
             optimized_parks = generate_optimized_trip(nearby_parks, city_coords, max_miles=miles_value)
             if optimized_parks:
                 nearby_parks = optimized_parks
-        if not nearby_parks:
-            if hours_value:
-                return jsonify({'error': f'No parks found within {hours_value} hours'}), 404
-            elif miles_value:
-                return jsonify({'error': f'No parks found within {miles_value} miles'}), 404
-            else:
-                return jsonify({'error': f'No parks found within {radius_value} miles'}), 404
+        # Don't override nearby_parks if no optimization was done (it already contains the filtered results)
         
         # Generate Google Maps URL with markers
         google_maps_url = generate_google_maps_url_with_markers(city, nearby_parks)
