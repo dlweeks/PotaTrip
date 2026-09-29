@@ -185,8 +185,70 @@ def normalize_state(state):
     return s, None
 
 
+# Nominatim addresstype/type values that represent a real settlement or
+# administrative area. Anything else (residential, road, landuse, farm,
+# hotel, ...) is a street-level or POI match and must NOT be treated as
+# a city — e.g. "Manta, TX" only matches "Villa Manta" (a residential
+# area in San Antonio), which silently pulled in San Antonio parks.
+_SETTLEMENT_TYPES = {
+    "city", "town", "village", "hamlet", "municipality", "suburb",
+    "neighbourhood", "quarter", "borough", "capital", "isolated_dwelling",
+    "locality", "state", "province", "county", "county borough",
+    "local_administrative_area", "administrative", "civil",
+    "metropolitan_borough", "unitary_authority", "prefecture",
+    "regency", "district", "governorate", "oblast", "oblast_2",
+    "municipality_law", "commune", "parish", "census",
+    "census_designated_place", "local_government_area",
+}
+
+
+def _is_settlement(location):
+    """True if a Nominatim result is a settlement/admin area, not a road/POI."""
+    raw = getattr(location, "raw", None) or {}
+    kinds = {str(raw.get("addresstype", "")).lower(),
+             str(raw.get("type", "")).lower()}
+    return bool(kinds & _SETTLEMENT_TYPES)
+
+
+def _address_matches_state(location, state_or_province):
+    """When a state/province was given, the result must actually be in it.
+
+    Prevents a city-only retry from silently landing in another country
+    (e.g. bare "Manta" -> Manta, Italy).
+    """
+    if not state_or_province:
+        return True
+    display = (getattr(location, "address", "") or "").lower()
+    raw_display = (getattr(location, "raw", None) or {}).get(
+        "display_name", "").lower()
+    hay = display + " " + raw_display
+    state_l = str(state_or_province).lower()
+    if state_l in hay:
+        return True
+    # "TX" -> "Texas", "BC" -> "British Columbia"
+    code = state_l.upper()
+    full = _STATE_NAMES.get(code) or _PROVINCE_NAMES.get(code)
+    if full and full.lower() in hay:
+        return True
+    return False
+
+
+def _pick_settlement(locations, state_or_province=None):
+    """First settlement-level result that lies in the requested state, or None."""
+    for loc in locations or []:
+        if _is_settlement(loc) and _address_matches_state(loc,
+                                                        state_or_province):
+            return (loc.latitude, loc.longitude)
+    return None
+
+
 def geocode_city(city_name, state_or_province=None, country=None):
-    """Geocode 'city, state, country' via Nominatim (cached, polite UA)."""
+    """Geocode 'city, state, country' via Nominatim (cached, polite UA).
+
+    Only settlement-level matches are accepted; street/POI matches
+    (residential areas, roads, land use) are rejected so an invalid city
+    name returns None instead of coordinates for an unrelated place.
+    """
     if country is None and state_or_province:
         state_or_province, country = normalize_state(state_or_province)
     parts = [p for p in (city_name, state_or_province, country) if p]
@@ -197,14 +259,13 @@ def geocode_city(city_name, state_or_province=None, country=None):
     geolocator = Nominatim(user_agent=NOMINATIM_UA)
     coords = None
     try:
-        location = geolocator.geocode(location_string)
-        if location:
-            coords = (location.latitude, location.longitude)
-        elif state_or_province:
-            # State/province code may confuse Nominatim — retry with city only.
-            location = geolocator.geocode(str(city_name))
-            if location:
-                coords = (location.latitude, location.longitude)
+        results = geolocator.geocode(location_string, exactly_one=False) or []
+        coords = _pick_settlement(results, state_or_province)
+        if coords is None and state_or_province:
+            # State/province may confuse Nominatim — retry with city only,
+            # still requiring a settlement inside the requested state.
+            results = geolocator.geocode(str(city_name), exactly_one=False) or []
+            coords = _pick_settlement(results, state_or_province)
     except Exception as e:
         logger.error("Error geocoding %r: %s", location_string, e)
 

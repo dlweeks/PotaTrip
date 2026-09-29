@@ -297,3 +297,97 @@ class TestPlanTripEndpoint:
                            lambda: synthetic_df)
         r = client.post("/plan_trip", json={"city": "Eustace", "radius": "50"})
         assert "google.com/maps" in r.get_json()["googleMapsUrl"]
+
+
+# ------------------------------------------------- geocode settlement guard
+_REAL_GEOCODE = appmod.geocode_city  # captured before fixtures stub it out
+
+
+class FakeLoc:
+    def __init__(self, lat, lon, addresstype, display):
+        self.latitude = lat
+        self.longitude = lon
+        self.address = display
+        self.raw = {"addresstype": addresstype, "display_name": display}
+
+
+class FakeNominatim:
+    """Returns canned results keyed by the query string."""
+    responses = {}
+
+    def __init__(self, user_agent=None, **kw):
+        pass
+
+    def geocode(self, query, exactly_one=True):
+        return list(self.responses.get(query, []))
+
+
+class TestGeocodeSettlementGuard:
+    """Regression: 'Manta, TX' matched a residential area in San Antonio.
+
+    Only settlement/admin-area results inside the requested state should
+    be accepted; roads, POIs and out-of-state matches must return None.
+    """
+
+    @pytest.fixture(autouse=True)
+    def clear_cache(self, monkeypatch):
+        monkeypatch.setattr(appmod, "_geocode_cache", {})
+        monkeypatch.setattr(appmod, "Nominatim", FakeNominatim)
+
+    def test_residential_match_rejected(self):
+        FakeNominatim.responses = {
+            "Manta, TX": [FakeLoc(29.52, -98.59, "residential",
+                                  "Villa Manta, San Antonio, Texas")],
+        }
+        assert appmod.geocode_city("Manta, TX") is None
+
+    def test_road_match_rejected(self):
+        FakeNominatim.responses = {
+            "Manta, TX": [FakeLoc(32.7, -97.5, "road",
+                                  "Manta Street, White Settlement, Texas")],
+        }
+        assert appmod.geocode_city("Manta, TX") is None
+
+    def test_city_match_accepted(self):
+        FakeNominatim.responses = {
+            "Eustace, TX": [FakeLoc(32.307, -96.006, "village",
+                                   "Eustace, Henderson County, Texas")],
+        }
+        assert appmod.geocode_city("Eustace, TX") == (32.307, -96.006)
+
+    def test_city_only_retry_must_stay_in_state(self):
+        # Full query fails; bare-city retry lands in Italy -> rejected.
+        FakeNominatim.responses = {
+            "Manta, Texas": [],
+            "Manta": [FakeLoc(44.61, 7.48, "town",
+                             "Manta, Cuneo, Piemonte, Italia")],
+        }
+        assert appmod.geocode_city("Manta", "TX") is None
+
+    def test_city_only_retry_in_state_accepted(self):
+        FakeNominatim.responses = {
+            "Kermit, Texas": [],
+            "Kermit": [FakeLoc(31.85, -103.09, "city",
+                               "Kermit, Glasscock County, Texas")],
+        }
+        assert appmod.geocode_city("Kermit", "TX") == (31.85, -103.09)
+
+    def test_no_state_no_filter(self):
+        # Without a state, any settlement match is fine (worldwide mode).
+        FakeNominatim.responses = {
+            "Manta": [FakeLoc(44.61, 7.48, "town",
+                             "Manta, Cuneo, Piemonte, Italia")],
+        }
+        assert appmod.geocode_city("Manta") == (44.61, 7.48)
+
+    def test_full_api_rejects_residential_end_to_end(self, client, monkeypatch):
+        monkeypatch.setattr(appmod, "geocode_city", _REAL_GEOCODE)
+        monkeypatch.setattr(appmod, "_geocode_cache", {})
+        monkeypatch.setattr(appmod, "Nominatim", FakeNominatim)
+        FakeNominatim.responses = {
+            "Manta, TX": [FakeLoc(29.52, -98.59, "residential",
+                                 "Villa Manta, San Antonio, Texas")],
+        }
+        r = client.post("/plan_trip",
+                       json={"location": "Manta, TX", "radius": "50"})
+        assert r.status_code == 400
