@@ -1,388 +1,378 @@
 #!/usr/bin/python3
 """
-Complete Flask backend for POTA Trip Planner with proper time constraint algorithm
-Based on working algorithm from HoursTrip/pota_final_trip.py
+POTA Trip Planner — Flask backend.
+
+Plans Parks on the Air activation trips from a city: filters the POTA park
+database by radius / trip-hours / trip-miles, greedily builds a multi-park
+route that fits the budget (including the drive home), and returns a
+Google Maps directions URL with the parks as ordered waypoints.
 """
-from flask import Flask, request, jsonify, render_template_string
-import pandas as pd
-import sys
+import io
+import math
 import os
+import sys
 import logging
+import threading
+from urllib.parse import quote
+from datetime import datetime, timedelta
+
+import pandas as pd
+import requests
+from flask import Flask, request, jsonify, render_template_string
 from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
-import requests
-from datetime import datetime, timedelta
-import json
+
+# ---------------------------------------------------------------- constants
+AVG_SPEED_MPH = 40.0          # assumed average driving speed
+ACTIVATION_HOURS = 2.0        # time spent at the park activating
+CACHE_MAX_AGE_DAYS = 7
+DEFAULT_RADIUS_MILES = 100.0
+MAX_MAP_WAYPOINTS = 10        # parks included in the Google Maps route
+POTA_CSV_URL = "https://pota.app/all_parks_ext.csv"
+CACHE_FILE = os.environ.get("POTA_CACHE_FILE", "/tmp/pota_parks_cache.csv")
+LOG_FILE = os.environ.get("POTA_LOG_FILE", "/tmp/pota_trip_log.txt")
+NOMINATIM_UA = os.environ.get(
+    "POTA_GEOCODE_UA",
+    "PotaTripPlanner/2.0 (amateur radio trip planner; run locally)",
+)
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('/tmp/pota_trip_log.txt'),
+        logging.FileHandler(LOG_FILE),
         logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
 
-# Create Flask app
 app = Flask(__name__)
 
-# Cache management functions
-def get_cache_file():
-    """Get the cache file path"""
-    return "/tmp/pota_parks_cache.csv"
+_cache_lock = threading.Lock()
+_geocode_cache = {}
 
+
+# ---------------------------------------------------------------- validation
+def parse_positive_float(raw):
+    """Parse a user-supplied constraint to a positive float.
+
+    Returns None for empty/missing/invalid/non-positive values so that
+    0 and "0" are handled consistently (treated as 'not provided').
+    """
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (ValueError, TypeError):
+        return None
+    if math.isnan(value) or value <= 0:
+        return None
+    return value
+
+
+# ---------------------------------------------------------------- cache
 def is_cache_valid():
-    """Check if cache file exists and is less than 7 days old"""
-    cache_file = get_cache_file()
-    if not os.path.exists(cache_file):
+    """True if the cache file exists and is younger than CACHE_MAX_AGE_DAYS."""
+    if not os.path.exists(CACHE_FILE):
         return False
-    
-    # Check file modification time
-    mod_time = os.path.getmtime(cache_file)
-    mod_datetime = datetime.fromtimestamp(mod_time)
-    seven_days_ago = datetime.now() - timedelta(days=7)
-    
-    return mod_datetime > seven_days_ago
+    mod_datetime = datetime.fromtimestamp(os.path.getmtime(CACHE_FILE))
+    return mod_datetime > datetime.now() - timedelta(days=CACHE_MAX_AGE_DAYS)
+
+
+def _filter_active(df):
+    """Keep only currently-active POTA parks."""
+    if "active" in df.columns:
+        before = len(df)
+        df = df[df["active"] == 1]
+        logger.info(
+            "Filtered out %d inactive parks (%d active remain)",
+            before - len(df), len(df),
+        )
+    return df
+
+
+def _download_parks():
+    """Download the full POTA park database with explicit timeout/status checks."""
+    resp = requests.get(POTA_CSV_URL, timeout=30)
+    resp.raise_for_status()
+    df = pd.read_csv(io.StringIO(resp.text))
+    if "reference" not in df.columns:
+        raise ValueError("Downloaded CSV is not the POTA parks file "
+                        "(missing 'reference' column)")
+    return df
+
+
+def _atomic_to_csv(df, path):
+    """Write CSV atomically: temp file in the same dir, then os.replace()."""
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    df.to_csv(tmp_path, index=False)
+    os.replace(tmp_path, path)
+
 
 def load_parks_from_cache():
-    """Load parks from cached CSV file or download fresh if needed"""
+    """Load active parks from cache, downloading fresh data when stale."""
     try:
-        cache_file = get_cache_file()
-        
-        # First, try to load from cache
-        if os.path.exists(cache_file) and is_cache_valid():
-            df = pd.read_csv(cache_file)
-            logger.info(f"Loaded {len(df)} parks from cache")
-            return df
-        else:
-            logger.info("Cache not valid or doesn't exist, downloading fresh data...")
-            # Download the full park database
-            url = "https://pota.app/all_parks_ext.csv"
-            df = pd.read_csv(url)
-            
-            # Save to cache file
-            df.to_csv(cache_file, index=False)
-            logger.info(f"Downloaded and cached {len(df)} parks")
-            return df
-            
+        if os.path.exists(CACHE_FILE) and is_cache_valid():
+            df = pd.read_csv(CACHE_FILE)
+            logger.info("Loaded %d parks from cache", len(df))
+            return _filter_active(df)
+
+        with _cache_lock:
+            # Re-check: another thread may have refreshed while we waited.
+            if os.path.exists(CACHE_FILE) and is_cache_valid():
+                df = pd.read_csv(CACHE_FILE)
+            else:
+                logger.info("Cache stale/missing — downloading fresh data...")
+                df = _download_parks()
+                _atomic_to_csv(df, CACHE_FILE)
+                logger.info("Downloaded and cached %d parks", len(df))
+        return _filter_active(df)
     except Exception as e:
-        logger.error(f"Error in load_parks_from_cache: {e}")
-        # Try to load cached data even if it's old or corrupted
+        logger.exception("Error refreshing park data: %s", e)
+        # Fall back to stale cache if we have one.
         try:
-            if os.path.exists(cache_file):
-                df = pd.read_csv(cache_file)
-                logger.info(f"Loaded {len(df)} parks from stale cache")
-                return df
+            if os.path.exists(CACHE_FILE):
+                df = pd.read_csv(CACHE_FILE)
+                logger.info("Loaded %d parks from stale cache", len(df))
+                return _filter_active(df)
         except Exception as e2:
-            logger.error(f"Error loading stale cache: {e2}")
-            # Return empty DataFrame to prevent crashes, but log the error
-            return pd.DataFrame()
+            logger.exception("Error loading stale cache: %s", e2)
+        return pd.DataFrame()
+
+
+# ---------------------------------------------------------------- geocoding
+_STATE_NAMES = {
+    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas",
+    "CA": "California", "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware",
+    "FL": "Florida", "GA": "Georgia", "HI": "Hawaii", "ID": "Idaho",
+    "IL": "Illinois", "IN": "Indiana", "IA": "Iowa", "KS": "Kansas",
+    "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine", "MD": "Maryland",
+    "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota",
+    "MS": "Mississippi", "MO": "Missouri", "MT": "Montana", "NE": "Nebraska",
+    "NV": "Nevada", "NH": "New Hampshire", "NJ": "New Jersey",
+    "NM": "New Mexico", "NY": "New York", "NC": "North Carolina",
+    "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma", "OR": "Oregon",
+    "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina",
+    "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah",
+    "VT": "Vermont", "VA": "Virginia", "WA": "Washington",
+    "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming",
+}
+_PROVINCE_NAMES = {
+    "AB": "Alberta", "BC": "British Columbia", "MB": "Manitoba",
+    "NB": "New Brunswick", "NL": "Newfoundland and Labrador",
+    "NS": "Nova Scotia", "NT": "Northwest Territories", "NU": "Nunavut",
+    "ON": "Ontario", "PE": "Prince Edward Island", "QC": "Quebec",
+    "SK": "Saskatchewan", "YT": "Yukon",
+}
+
+
+def normalize_state(state):
+    """Expand 'US-TX'/'CA-ON' style codes to full names + country.
+
+    Returns (state_string, country_string_or_None).
+    """
+    if not state:
+        return state, None
+    s = str(state).strip()
+    if "-" in s:
+        prefix, code = s.split("-", 1)
+        code_u = code.upper()
+        if prefix.upper() == "US" and code_u in _STATE_NAMES:
+            return _STATE_NAMES[code_u], "USA"
+        if prefix.upper() == "CA" and code_u in _PROVINCE_NAMES:
+            return _PROVINCE_NAMES[code_u], "Canada"
+    return s, None
+
 
 def geocode_city(city_name, state_or_province=None, country=None):
-    """
-    Convert city name to lat/lng coordinates with international support
-    Works with city, state/province, country format
-    """
+    """Geocode 'city, state, country' via Nominatim (cached, polite UA)."""
+    if country is None and state_or_province:
+        state_or_province, country = normalize_state(state_or_province)
+    parts = [p for p in (city_name, state_or_province, country) if p]
+    location_string = ", ".join(parts)
+    if location_string in _geocode_cache:
+        return _geocode_cache[location_string]
+
+    geolocator = Nominatim(user_agent=NOMINATIM_UA)
+    coords = None
     try:
-        # Build full location string for geocoding
-        location_string = city_name
-        if state_or_province:
-            location_string += f", {state_or_province}"
-        if country:
-            location_string += f", {country}"
-            
-        # Use Nominatim geocoder (OpenStreetMap)
-        geolocator = Nominatim(user_agent="potatrip")
         location = geolocator.geocode(location_string)
-        
         if location:
-            return (location.latitude, location.longitude)
-        else:
-            logger.warning(f"Could not geocode location: {location_string}")
-            return None
+            coords = (location.latitude, location.longitude)
+        elif state_or_province:
+            # State/province code may confuse Nominatim — retry with city only.
+            location = geolocator.geocode(str(city_name))
+            if location:
+                coords = (location.latitude, location.longitude)
     except Exception as e:
-        logger.error(f"Error geocoding city: {e}")
-        return None
+        logger.error("Error geocoding %r: %s", location_string, e)
 
-def calculate_driving_time(point1, point2):
-    """Calculate approximate driving time between two points"""
-    distance = geodesic(point1, point2).miles
-    # Average driving speed is ~40 mph
-    driving_time_hours = distance / 40.0
-    return driving_time_hours
+    if coords is None:
+        logger.warning("Could not geocode location: %s", location_string)
+    _geocode_cache[location_string] = coords
+    return coords
 
-def find_nearby_parks(parks_df, city_coords, max_distance_miles=100, max_hours=None, max_miles=None):
-    """Find parks within specified constraints"""
-    nearby_parks = []
-    
-    # Check if we have data
-    if parks_df.empty:
-        return []
-    
-    # Apply distance constraint first to reduce the dataset
-    if max_distance_miles is not None and max_distance_miles > 0:
-        # Filter by radius first
-        filtered_parks = []
-        for index, park in parks_df.iterrows():
-            if 'latitude' in park and 'longitude' in park:
-                if not pd.isna(park['latitude']) and not pd.isna(park['longitude']):
-                    try:
-                        # Safely extract coordinates as scalars
-                        lat = float(park['latitude'])
-                        lon = float(park['longitude'])
-                        park_coords = (lat, lon)
-                        
-                        distance = geodesic(city_coords, park_coords).miles
-                        
-                        # If this park is within the distance constraint, add it
-                        if distance <= max_distance_miles:
-                            park['distance_miles'] = distance
-                            filtered_parks.append(park)
-                    except Exception as e:
-                        # Skip invalid coordinates
-                        continue
-        
-        # Sort by distance (nearest to farthest)
-        filtered_parks.sort(key=lambda x: x.get('distance_miles', 0))
-        
-        # Now apply time or distance constraints to filtered list
-        if max_hours is not None and max_hours > 0:
-            # Apply time constraint - prioritize by time (shorter trip times first)
-            for park in filtered_parks:
-                if 'latitude' in park and 'longitude' in park:
-                    try:
-                        # Safely extract coordinates as scalars
-                        lat = float(park['latitude'])
-                        lon = float(park['longitude'])
-                        park_coords = (lat, lon)
-                        
-                        # Calculate time to park
-                        driving_time = calculate_driving_time(city_coords, park_coords)
-                        # Time constraint: 2 hours at park + driving time
-                        total_time = driving_time + 2  # 2 hours at park + driving time
-                        
-                        # If this park can be visited within the time limit, add it
-                        if total_time <= max_hours:
-                            nearby_parks.append(park)
-                    except Exception as e:
-                        # Skip invalid coordinates
-                        continue
-                        
-        elif max_miles is not None and max_miles > 0:
-            # Apply miles constraint - prioritize by distance (shorter round trips first)
-            for park in filtered_parks:
-                if 'latitude' in park and 'longitude' in park:
-                    try:
-                        # Safely extract coordinates as scalars
-                        lat = float(park['latitude'])
-                        lon = float(park['longitude'])
-                        park_coords = (lat, lon)
-                        
-                        # Calculate round trip distance
-                        driving_time = calculate_driving_time(city_coords, park_coords)
-                        round_trip_miles = driving_time * 40  # assuming 40 mph average
-                        
-                        # If this park fits within the miles constraint, add it
-                        if round_trip_miles <= max_miles:
-                            nearby_parks.append(park)
-                    except Exception as e:
-                        # Skip invalid coordinates
-                        continue
-        else:
-            # No time or distance constraint, return filtered parks
-            nearby_parks = filtered_parks
-            
-    else:
-        # No radius constraint, apply time or distance constraints directly
-        if max_hours is not None and max_hours > 0:
-            # Apply time constraint to all parks
-            for index, park in parks_df.iterrows():
-                if 'latitude' in park and 'longitude' in park:
-                    if not pd.isna(park['latitude']) and not pd.isna(park['longitude']):
-                        try:
-                            # Safely extract coordinates as scalars
-                            lat = float(park['latitude'])
-                            lon = float(park['longitude'])
-                            park_coords = (lat, lon)
-                            
-                            # Calculate time to park
-                            driving_time = calculate_driving_time(city_coords, park_coords)
-                            # Time constraint: 2 hours at park + driving time
-                            total_time = driving_time + 2  # 2 hours at park + driving time
-                            
-                            # If this park can be visited within the time limit, add it
-                            if total_time <= max_hours:
-                                nearby_parks.append(park)
-                        except Exception as e:
-                            # Skip invalid coordinates
-                            continue
-                            
-        elif max_miles is not None and max_miles > 0:
-            # Apply miles constraint to all parks
-            for index, park in parks_df.iterrows():
-                if 'latitude' in park and 'longitude' in park:
-                    if not pd.isna(park['latitude']) and not pd.isna(park['longitude']):
-                        try:
-                            # Safely extract coordinates as scalars
-                            lat = float(park['latitude'])
-                            lon = float(park['longitude'])
-                            park_coords = (lat, lon)
-                            
-                            # Calculate round trip distance
-                            driving_time = calculate_driving_time(city_coords, park_coords)
-                            round_trip_miles = driving_time * 40  # assuming 40 mph average
-                            
-                            # If this park fits within the miles constraint, add it
-                            if round_trip_miles <= max_miles:
-                                nearby_parks.append(park)
-                        except Exception as e:
-                            # Skip invalid coordinates
-                            continue
-        else:
-            # No constraints, return all parks
-            nearby_parks = parks_df.to_dict('records')
-    
-    # Log selected parks for debugging (only when time constraint is used)
-    if max_hours is not None and len(nearby_parks) > 0:
-        logger.info(f"\n=== SELECTED PARKS FOR {max_hours} HOUR CONSTRAINT ===")
-        # Only show first 10 for brevity, but show the actual count
-        for i, park in enumerate(nearby_parks[:10]):  # Show top 10 only
-            name = park.get('name', 'Unknown')
-            logger.info(f"{i+1}. {name}")
-        logger.info(f"Total parks selected: {len(nearby_parks)}")
-        logger.info("==========================================\n")
-    
-    return nearby_parks
 
-def calculate_total_trip_time(parks, city_coords):
-    """Calculate the total time for a trip including travel between parks"""
-    if len(parks) <= 1:
-        return 0
-    
-    total_time = 0
-    current_coords = city_coords
-    
-    # For each park, calculate travel time and add 2 hours for visit
-    for park in parks:
-        if 'latitude' in park and 'longitude' in park:
-            park_coords = (float(park['latitude']), float(park['longitude']))
-            driving_time = calculate_driving_time(current_coords, park_coords)
-            total_time += driving_time + 2  # 2 hours at park
-            current_coords = park_coords
-    
-    return total_time
-
-def generate_google_maps_url_with_markers(city, parks):
-    """Generate Google Maps URL with park number markers using proper labeling"""
+# ---------------------------------------------------------------- core math
+def _park_coords(park):
+    """Return (lat, lon) for a park dict/row, or None if unusable."""
     try:
-        # Create a better URL with proper labeling for each park
-        base_url = "https://www.google.com/maps/dir/?api=1"
-        
-        # Add origin
-        origin = city.replace(' ', '+')
-        base_url += f"&origin={origin}"
-        
-        # Add destination (same as origin for circular route)
-        base_url += f"&destination={origin}"
-        
-        # Add waypoints with proper labels for each park
-        waypoints = []
-        markers = []
-        
-        for i, park in enumerate(parks[:10]):  # Limit to first 10 parks
-            if 'latitude' in park and 'longitude' in park:
-                lat = park['latitude']
-                lng = park['longitude']
-                # Format as lat,lng for Google Maps
-                waypoints.append(f"{lat},{lng}")
-                
-                # Add marker for this specific park with label
-                marker_label = str(i + 1)  # Park numbers 1, 2, 3...
-                markers.append(f"markers=label:{marker_label}%7C{lat},{lng}")
-        
-        if waypoints:
-            waypoints_str = '|'.join(waypoints)
-            base_url += f"&waypoints={waypoints_str}"
-        
-        # Add markers to the URL
-        if markers:
-            markers_str = '|'.join(markers)
-            base_url += f"&map_action=overlay&overlay={markers_str}"
-        
-        logger.info(f"Generated Google Maps URL: {base_url}")
-        return base_url
-        
-    except Exception as e:
-        logger.error(f"Error generating Google Maps URL with markers: {e}")
-        return "https://www.google.com/maps"
+        lat = float(park["latitude"])
+        lon = float(park["longitude"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if math.isnan(lat) or math.isnan(lon):
+        return None
+    return (lat, lon)
+
+
+def one_way_miles(city_coords, park):
+    """Great-circle one-way distance from city to park, or None."""
+    coords = _park_coords(park)
+    if coords is None:
+        return None
+    return geodesic(city_coords, coords).miles
+
+
+def trip_hours_for_park(one_way):
+    """Round-trip driving hours plus the activation stop for a single park."""
+    return 2 * one_way / AVG_SPEED_MPH + ACTIVATION_HOURS
+
+
+def find_nearby_parks(parks_df, city_coords, max_distance_miles=None,
+                     max_hours=None, max_miles=None):
+    """Return active park records (dicts) satisfying ALL given constraints.
+
+    Constraints are a funnel, not an either/or:
+      - max_distance_miles: straight-line radius from the city
+      - max_hours: round-trip drive time + ACTIVATION_HOURS per park
+      - max_miles: round-trip mileage per park
+    Results are sorted nearest-first with a `distance_miles` key.
+    """
+    if parks_df is None or parks_df.empty:
+        return []
+    if not {"latitude", "longitude"} <= set(parks_df.columns):
+        return []
+
+    df = _filter_active(parks_df).dropna(subset=["latitude", "longitude"]).copy()
+
+    # Bounding-box prefilter so we only run geodesic on plausible parks.
+    radius = max_distance_miles
+    if radius is None:
+        radius = float("inf")
+    if max_hours is not None:
+        # hours budget -> max one-way miles
+        budget_miles = (max_hours - ACTIVATION_HOURS) * AVG_SPEED_MPH / 2
+        radius = min(radius, max(budget_miles, 0.0))
+    if max_miles is not None:
+        radius = min(radius, max_miles / 2)
+    if math.isfinite(radius) and radius > 0:
+        lat0, lon0 = float(city_coords[0]), float(city_coords[1])
+        lat_span = radius / 69.0
+        cos_lat = max(math.cos(math.radians(lat0)), 1e-6)
+        lon_span = radius / (69.0 * cos_lat)
+        df = df[
+            df["latitude"].between(lat0 - lat_span, lat0 + lat_span)
+            & df["longitude"].between(lon0 - lon_span, lon0 + lon_span)
+        ]
+
+    results = []
+    for park in df.to_dict("records"):
+        one_way = one_way_miles(city_coords, park)
+        if one_way is None:
+            continue
+        if max_distance_miles is not None and one_way > max_distance_miles:
+            continue
+        if max_miles is not None and 2 * one_way > max_miles:
+            continue
+        if max_hours is not None and trip_hours_for_park(one_way) > max_hours:
+            continue
+        park["distance_miles"] = one_way
+        results.append(park)
+
+    results.sort(key=lambda p: p["distance_miles"])
+    logger.info("find_nearby_parks: %d parks (radius=%s hours=%s miles=%s)",
+               len(results), max_distance_miles, max_hours, max_miles)
+    return results
+
 
 def generate_optimized_trip(parks, city_coords, max_hours=None, max_miles=None):
-    """
-    Generate an optimized trip that visits parks in logical order.
-    This implements the core logic for the trip planner.
+    """Greedy nearest-neighbour multi-park route that fits the budget.
+
+    Budget accounting includes the drive from the last park back home.
+    Parks that don't fit are skipped (not a hard stop), so a farther-then-
+    nearer ordering can still add closer parks later.
     """
     if not parks:
         return []
-    
-    # For time constraint, we want to build a trip that fits within the time limit
-    if max_hours is not None:
-        # We'll build a trip by adding parks one by one until we exceed the time limit
-        selected_parks = []
-        current_coords = city_coords
-        total_time = 0
-        
-        # Sort parks by distance to start (nearest first) for better route optimization
-        sorted_parks = sorted(parks, key=lambda x: x.get('distance_miles', 0))
-        
-        # Add parks to trip one by one until time limit is reached
-        for park in sorted_parks:
-            if 'latitude' in park and 'longitude' in park:
-                try:
-                    park_coords = (float(park['latitude']), float(park['longitude']))
-                    driving_time = calculate_driving_time(current_coords, park_coords)
-                    total_time += driving_time + 2  # 2 hours at park
-                    
-                    if total_time <= max_hours:
-                        selected_parks.append(park)
-                        current_coords = park_coords
-                    else:
-                        break  # We've exceeded the time limit
-                except Exception as e:
-                    # Skip invalid coordinates
-                    continue
-        return selected_parks
-    
-    # For miles constraint, we'll just return the first N parks that fit within the distance limit
-    if max_miles is not None:
-        selected_parks = []
-        total_distance = 0
-        
-        # Sort parks by distance to start (nearest first) for better route optimization
-        sorted_parks = sorted(parks, key=lambda x: x.get('distance_miles', 0))
-        
-        for park in sorted_parks:
-            if 'latitude' in park and 'longitude' in park:
-                try:
-                    park_coords = (float(park['latitude']), float(park['longitude']))
-                    distance = geodesic(city_coords, park_coords).miles
-                    round_trip = distance * 2  # Round trip
-                    
-                    if total_distance + round_trip <= max_miles:
-                        selected_parks.append(park)
-                        total_distance += round_trip
-                    else:
-                        break  # We've exceeded the distance limit
-                except Exception as e:
-                    # Skip invalid coordinates
-                    continue
-        return selected_parks
-    
-    # For radius constraint, return all parks within radius
-    return parks
+    if max_hours is None and max_miles is None:
+        return list(parks)
 
-# HTML template for the main page with enhanced UI
+    selected = []
+    remaining = list(parks)
+    current = tuple(city_coords)
+    time_used = 0.0   # driving hours + activations so far
+    route_miles = 0.0  # driven miles so far
+
+    while True:
+        best = None
+        best_leg = None
+        for park in remaining:
+            coords = _park_coords(park)
+            if coords is None:
+                continue
+            leg = geodesic(current, coords).miles
+            home_leg = geodesic(coords, city_coords).miles
+            if max_hours is not None:
+                projected = time_used + leg / AVG_SPEED_MPH + ACTIVATION_HOURS \
+                    + home_leg / AVG_SPEED_MPH
+                if projected > max_hours:
+                    continue
+            if max_miles is not None:
+                if route_miles + leg + home_leg > max_miles:
+                    continue
+            if best_leg is None or leg < best_leg:
+                best, best_leg = park, leg
+
+        if best is None:
+            break
+        coords = _park_coords(best)
+        time_used += best_leg / AVG_SPEED_MPH + ACTIVATION_HOURS
+        route_miles += best_leg
+        selected.append(best)
+        current = coords
+        remaining.remove(best)
+
+    return selected
+
+
+def generate_google_maps_url_with_markers(city, parks):
+    """Google Maps directions URL: city -> parks (numbered stops) -> city.
+
+    Google renders directions waypoints as numbered stops, which matches
+    the numbered list shown in the UI.
+    """
+    try:
+        waypoints = []
+        for park in parks[:MAX_MAP_WAYPOINTS]:
+            coords = _park_coords(park)
+            if coords:
+                waypoints.append(f"{coords[0]},{coords[1]}")
+
+        origin = quote(str(city))
+        url = ("https://www.google.com/maps/dir/?api=1"
+               f"&origin={origin}&destination={origin}")
+        if waypoints:
+            url += "&waypoints=" + "|".join(waypoints)
+        logger.info("Generated Google Maps URL: %s", url)
+        return url
+    except Exception as e:
+        logger.exception("Error generating Google Maps URL: %s", e)
+        return "https://www.google.com/maps"
+
+
+# ---------------------------------------------------------------- frontend
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -768,22 +758,21 @@ HTML_TEMPLATE = '''
             <div class="instructions">
                 <h3>Features</h3>
                 <ul>
-                    <li>Worldwide POTA parks</li>
+                    <li>Worldwide active POTA parks only</li>
                     <li>Dark/light mode toggle</li>
                     <li>Google Maps integration</li>
-                    <li>Time constraint support</li>
+                    <li>Time constraint support (includes drive home)</li>
                     <li>Distance filtering</li>
-                    <li>Multiple filtering options</li>
+                    <li>Constraints combine (radius AND hours AND miles)</li>
                 </ul>
             </div>
             
             <div class="instructions">
                 <h3>Pro Tips</h3>
                 <ul>
-                    <li>Try "Eustace, TX" with 4 hours</li>
-                    <li>Use "100 miles" for wide coverage</li>
-                    <li>Set hours to limit travel time</li>
-                    <li>Check Google Maps for directions</li>
+                    <li>Try "Eustace" with Texas and 4 hours</li>
+                    <li>Hours budget = round-trip driving + 2h activation per park</li>
+                    <li>Check Google Maps for the numbered route</li>
                 </ul>
             </div>
         </div>
@@ -898,6 +887,14 @@ HTML_TEMPLATE = '''
     </div>
 
     <script>
+        // Escape untrusted strings before inserting into innerHTML
+        // (POTA park names are user-editable upstream).
+        function esc(s) {
+            return String(s).replace(/[&<>"']/g, c => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+            }[c]));
+        }
+
         function toggleDarkMode() {
             document.body.classList.toggle('dark-mode');
             const isDarkMode = document.body.classList.contains('dark-mode');
@@ -955,11 +952,9 @@ HTML_TEMPLATE = '''
                 const mapsLink = document.getElementById('mapsLink');
                 
                 if (result.error) {
-                    // Show error
-                    resultContent.innerHTML = `<div class="error">${result.error}</div>`;
+                    resultContent.innerHTML = `<div class="error">${esc(result.error)}</div>`;
                     resultDiv.style.display = 'block';
                 } else {
-                    // Show results
                     resultCity.textContent = data.city;
                     let parksHTML = '<div class="park-list">';
                     result.parks.forEach((park, index) => {
@@ -967,9 +962,9 @@ HTML_TEMPLATE = '''
                             <div class="park-item">
                                 <div class="park-info">
                                     <span class="park-number-marker">${index + 1}</span>
-                                    <span class="park-name">${park.name}</span>
+                                    <span class="park-name">${esc(park.name)}</span>
                                     <br>
-                                    <span class="park-reference">${park.reference}</span>
+                                    <span class="park-reference">${esc(park.reference)}</span>
                                 </div>
                                 <div class="park-distance">${park.distance.toFixed(1)} miles</div>
                             </div>
@@ -984,7 +979,7 @@ HTML_TEMPLATE = '''
             })
             .catch(error => {
                 const resultContent = document.getElementById('resultContent');
-                resultContent.innerHTML = `<div class="error">Network error: ${error.message}</div>`;
+                resultContent.innerHTML = `<div class="error">Network error: ${esc(error.message)}</div>`;
                 resultDiv.style.display = 'block';
             })
             .finally(() => {
@@ -1001,115 +996,92 @@ HTML_TEMPLATE = '''
 def index():
     return render_template_string(HTML_TEMPLATE)
 
+
+@app.route('/health')
+def health():
+    return jsonify({'status': 'ok',
+                   'cache_valid': is_cache_valid(),
+                   'cache_file': CACHE_FILE})
+
+
 @app.route('/plan_trip', methods=['POST'])
 def plan_trip():
     try:
-        data = request.get_json()
-        
-        city = data.get('city')
-        state = data.get('state', 'US-TX')
-        radius = data.get('radius', 100)
-        hours = data.get('hours')
-        miles = data.get('miles')
-        
-        # Validate that at least one constraint is provided
-        if not hours and not miles and not radius:
-            return jsonify({'error': 'Please provide at least one constraint (Hours, Miles, or Radius)'}), 400
-        
-        # Convert to numbers with proper error handling
-        try:
-            radius_value = float(radius) if radius else 100
-        except (ValueError, TypeError):
-            radius_value = 100
-            
-        try:
-            hours_value = float(hours) if hours else None
-        except (ValueError, TypeError):
-            hours_value = None
-            
-        try:
-            miles_value = float(miles) if miles else None
-        except (ValueError, TypeError):
-            miles_value = None
-        
-        # Log the request parameters
-        logger.info(f"Planning trip for {city}, {state} with constraints: radius={radius_value}, hours={hours_value}, miles={miles_value}")
-        
-        # Load parks
+        data = request.get_json(silent=True) or {}
+
+        city = (data.get('city') or '').strip()
+        if not city:
+            return jsonify({'error': 'Please provide a city name.'}), 400
+        state = data.get('state') or None
+        if state == 'Other':
+            state = None
+
+        radius_value = parse_positive_float(data.get('radius'))
+        hours_value = parse_positive_float(data.get('hours'))
+        miles_value = parse_positive_float(data.get('miles'))
+
+        if radius_value is None and hours_value is None and miles_value is None:
+            return jsonify({'error': 'Please provide at least one positive '
+                                    'constraint (Radius, Hours, or Miles).'}), 400
+        if radius_value is None:
+            radius_value = DEFAULT_RADIUS_MILES
+
+        logger.info("Planning trip for %s (%s): radius=%s hours=%s miles=%s",
+                    city, state, radius_value, hours_value, miles_value)
+
         parks_df = load_parks_from_cache()
         if parks_df.empty:
-            return jsonify({'error': 'Could not load park data. Please try again later.'}), 500
-        
-        # Geocode city
+            return jsonify({'error': 'Could not load park data. '
+                                    'Please try again later.'}), 500
+
         city_coords = geocode_city(city, state)
         if not city_coords:
-            return jsonify({'error': 'Could not find city coordinates. Please check the city name and try again.'}), 400
-        
-        # Find nearby parks with constraints
-        if hours_value:
-            nearby_parks = find_nearby_parks(parks_df, city_coords, max_hours=hours_value)
-        elif miles_value:
-            nearby_parks = find_nearby_parks(parks_df, city_coords, max_miles=miles_value)
-        elif radius_value:
-            nearby_parks = find_nearby_parks(parks_df, city_coords, max_distance_miles=radius_value)
-        else:
-            nearby_parks = find_nearby_parks(parks_df, city_coords)
-        
-        # Optimize the trip based on constraints
-        if hours_value:
-            optimized_parks = generate_optimized_trip(nearby_parks, city_coords, max_hours=hours_value)
-            if optimized_parks:
-                nearby_parks = optimized_parks
-        elif miles_value:
-            optimized_parks = generate_optimized_trip(nearby_parks, city_coords, max_miles=miles_value)
-            if optimized_parks:
-                nearby_parks = optimized_parks
-        # Don't override nearby_parks if no optimization was done (it already contains the filtered results)
-        
-        # Generate Google Maps URL with markers
-        google_maps_url = generate_google_maps_url_with_markers(city, nearby_parks)
-        
-        # Prepare response
-        parks_data = []
-        for park in nearby_parks:
-            name = park.get('name', 'Unnamed Park')
-            ref = park.get('reference', 'Unknown')
-            distance = 0
-            
-            if 'latitude' in park and 'longitude' in park:
-                park_coords = (float(park['latitude']), float(park['longitude']))
-                distance = geodesic(city_coords, park_coords).miles
-            
-            parks_data.append({
-                'name': name,
-                'reference': ref,
-                'distance': distance
-            })
-        
+            return jsonify({'error': 'Could not find city coordinates. '
+                                    'Please check the city name and try again.'}), 400
+
+        # Apply ALL constraints as a funnel (radius always applies).
+        nearby_parks = find_nearby_parks(
+            parks_df, city_coords,
+            max_distance_miles=radius_value,
+            max_hours=hours_value,
+            max_miles=miles_value,
+        )
+
+        # Build a multi-park route that fits the budget (if any budget given).
+        if hours_value or miles_value:
+            optimized = generate_optimized_trip(
+                nearby_parks, city_coords,
+                max_hours=hours_value, max_miles=miles_value)
+            if optimized:
+                nearby_parks = optimized
+
+        parks_data = [{
+            'name': park.get('name', 'Unnamed Park'),
+            'reference': park.get('reference', 'Unknown'),
+            'distance': round(park.get('distance_miles', 0.0), 2),
+        } for park in nearby_parks]
+
         response_data = {
             'city': city,
             'parkCount': len(parks_data),
             'parks': parks_data,
-            'googleMapsUrl': google_maps_url
+            'googleMapsUrl': generate_google_maps_url_with_markers(city,
+                                                                  nearby_parks),
         }
-        
-        # Log the successful request
-        logger.info(f"Successfully planned trip with {len(parks_data)} parks for {city}")
-        
+        logger.info("Planned trip: %d parks for %s", len(parks_data), city)
         return jsonify(response_data)
-        
+
     except Exception as e:
-        # Log the full error for debugging
-        logger.error(f"Application error: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': f'Application error: {str(e)}'}), 500
+        logger.exception("Application error: %s", e)
+        return jsonify({'error': f'Application error: {type(e).__name__}'}), 500
+
 
 if __name__ == '__main__':
-    # Initialize cache on startup
     logger.info("Initializing POTA Trip Planner...")
     parks_df = load_parks_from_cache()
-    logger.info(f"Loaded {len(parks_df)} parks from cache")
-    logger.info("Starting POTA Trip Planner server...")
-    logger.info("Visit http://localhost:5001 to use the application")
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    logger.info("Loaded %d active parks", len(parks_df))
+    host = os.environ.get("POTA_HOST", "127.0.0.1")
+    port = int(os.environ.get("POTA_PORT", "5001"))
+    debug = os.environ.get("POTA_DEBUG", "0") == "1"
+    logger.info("Starting POTA Trip Planner at http://%s:%d", host, port)
+    app.run(host=host, port=port, debug=debug)

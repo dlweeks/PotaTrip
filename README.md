@@ -5,27 +5,33 @@ A web application for planning ham radio park visiting trips using the POTA (Par
 ## Features
 
 - **Web Interface**: Easy-to-use form with input boxes for all parameters
-- **Multiple Filtering Options**: 
-  - Radius (miles) - filter parks within a certain distance
-  - Maximum Hours - filter parks that can be visited within a time limit
-  - Maximum Round-trip Miles - filter parks based on travel distance
-- **Automatic CSV Caching**: Database updates automatically every 5 days
-- **Google Maps Integration**: Embedded links to trip planning
-- **Error Handling**: Proper validation to prevent "Could not convert string to float" errors
+- **Active Parks Only**: Deactivated POTA parks are filtered out at load time
+- **Combining Constraints** (applied as a funnel, all at once):
+  - Radius (miles) — straight-line distance from the city (default 100)
+  - Maximum Hours — round-trip driving time + 2h activation per park
+  - Maximum Trip Miles — round-trip mileage per park
+- **Multi-Park Route Optimization**: greedy nearest-neighbour selection that
+  keeps the whole route (including the drive home) inside the time/miles budget
+- **Automatic CSV Caching**: database refreshes when older than 7 days;
+  downloads are atomic and lock-guarded
+- **Google Maps Integration**: directions URL with the city as origin/destination
+  and parks as numbered waypoints
+- **Input Validation**: empty/zero/negative/non-numeric constraints are rejected
+  cleanly (no float-conversion crashes)
 
 ## Project Structure
 
-This project follows a clean structure:
-- `app.py` - Main web application
-- `index.html` - Web interface
-- `tests/` - Test cases and debugging tools
-- `docs/` - Documentation
+- `app.py` — main web application (UI is embedded in the Flask template)
+- `test_app.py` — pytest suite (31 tests)
+- `tests/` — legacy ad-hoc debug scripts (kept for reference; superseded by `test_app.py`)
+- `docs/` — documentation
 
 ## Installation
 
 1. Install required packages:
    ```bash
    pip3 install -r requirements.txt
+   pip3 install pytest   # for tests
    ```
 
 2. Run the application:
@@ -33,52 +39,53 @@ This project follows a clean structure:
    python3 app.py
    ```
 
-3. Visit `http://localhost:5000` in your web browser
+3. Visit `http://127.0.0.1:5001` in your web browser
+
+### Configuration (environment variables)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `POTA_HOST` | `127.0.0.1` | Bind address (set explicitly to expose on the network) |
+| `POTA_PORT` | `5001` | Port |
+| `POTA_DEBUG` | `0` | Set `1` to enable Werkzeug debugger (local dev only — RCE risk) |
+| `POTA_CACHE_FILE` | `/tmp/pota_parks_cache.csv` | Park database cache |
+| `POTA_LOG_FILE` | `/tmp/pota_trip_log.txt` | Log file |
+| `POTA_GEOCODE_UA` | `PotaTripPlanner/2.0 (...)` | Nominatim user agent (set your callsign/email if publishing) |
 
 ## Usage
 
 1. Enter a city name (e.g., "Eustace")
-2. Enter a state/region code (e.g., "US-TX")
-3. Set at least one constraint (Radius, Hours, or Miles)
+2. Select a state/province (US-XX / CA-XX codes are expanded to full names for geocoding)
+3. Set radius and optionally hours and/or trip miles
 4. Click "Plan My Trip"
 
-## Technical Details
+## Trip Planning Math
 
-1. Database Management System:
-   - Weekly recreation of the parks database from pota.app
-   - Caching mechanism that maintains database for up to a week
-   - Automatic database refresh when older than 7 days
-   - Proper cache file management
+- `AVG_SPEED_MPH = 40` — assumed average driving speed
+- `ACTIVATION_HOURS = 2` — time at each park
+- Hours budget for a single park: `2 * one_way_miles / 40 + 2` (round trip + activation)
+- Miles budget for a single park: `2 * one_way_miles`
+- Multi-park routes track the current position and always include the return leg
+  from the last park to the starting city in the budget check.
+- Parks that don't fit the budget are skipped, not a hard stop.
 
-2. Web Interface:
-   - Complete Flask web application with responsive UI
-   - City input with state/province selection
-   - Multiple constraint options (radius, hours, miles)
-   - Google Maps integration with park markers
-   - Dark/light mode toggle
+## Testing
 
-3. Trip Planning Algorithms:
-   - Radius filtering: Parks within specified distance
-   - Hours filtering: Parks that can be visited within time constraints (2 hours at each park + driving time)
-   - Miles filtering: Parks within specified round-trip distance limits
+```bash
+python3 -m pytest test_app.py -q
+```
 
-4. Logging & Debugging:
-   - Comprehensive logging of user inputs and trip data
-   - Server-side logging to /tmp/pota_trip_log.txt
-   - Detailed debugging information
-
-5. Test Coverage:
-   - All three constraint algorithms thoroughly tested
-   - Test cases for radius, hours, and miles constraints
-   - Verification that algorithms work correctly in the main program
+Covers: constraint parsing (incl. zero/NaN edge cases), inactive-park filtering,
+radius/hours/miles funnel logic, round-trip math, optimizer budget including
+drive-home, waypoint caps, and the HTTP endpoint (400s, defaults, geocode failure).
+Tests run offline against the cached CSV or synthetic frames; geocoding is stubbed.
 
 ## Error Handling
 
-The application handles the following errors gracefully:
-- "Could not convert string to float" - Fixed with proper input validation
-- City not found - Shows appropriate error message
-- No parks meeting criteria - Shows appropriate error message
-- Database connection issues - Shows appropriate error message
+- Invalid/zero/negative constraints → 400 with a clear message
+- City not found → 400
+- Park data unavailable (download fails, no cache) → 500
+- Nominatim failures are logged; geocode results are cached per session
 
 ## Requirements
 
@@ -86,3 +93,4 @@ The application handles the following errors gracefully:
 - pandas
 - geopy
 - requests
+- pytest (tests only)
