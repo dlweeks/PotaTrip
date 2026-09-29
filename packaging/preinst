@@ -1,0 +1,9 @@
+#!/bin/sh
+# preinst — stop a previously-installed service before overwriting files.
+set -e
+
+if [ "$1" = "upgrade" ] && systemctl is-active --quiet potatrip.service 2>/dev/null; then
+    systemctl stop potatrip.service || true
+fi
+
+exit 0

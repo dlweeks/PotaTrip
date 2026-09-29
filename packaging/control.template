@@ -1,0 +1,18 @@
+Package: potatrip
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: PotaTrip <dweeks@localhost>
+Installed-Size: 250000
+Depends: python3, systemd
+Section: hamradio
+Priority: optional
+Homepage: https://github.com/dweeks/PotaTrip
+Description: POTA Trip Planner - Parks on the Air trip planning web app
+ Plans multi-park POTA activation trips from a city: filters the POTA park
+ database by radius, trip-hours and trip-miles, builds a greedy multi-park
+ route that fits the budget (including the drive home), and returns a
+ Google Maps directions URL with the parks as ordered waypoints.
+ .
+ The app is installed under /opt/potatrip with a self-contained python3
+ virtual environment, launched via /usr/local/bin/potatrip, and run as the
+ systemd service "potatrip" on port 5001.

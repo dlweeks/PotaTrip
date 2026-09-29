@@ -1,0 +1,26 @@
+[Unit]
+Description=POTA Trip Planner (Flask web app)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=potatrip
+Group=potatrip
+Environment=POTA_HOST=0.0.0.0
+Environment=POTA_PORT=5001
+Environment=POTA_DEBUG=0
+Environment=POTA_CACHE_FILE=/var/lib/potatrip/all_parks_ext.csv
+Environment=POTA_LOG_FILE=/var/lib/potatrip/pota_trip_log.txt
+ExecStart=/usr/local/bin/potatrip
+Restart=on-failure
+RestartSec=5
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/potatrip
+
+[Install]
+WantedBy=multi-user.target

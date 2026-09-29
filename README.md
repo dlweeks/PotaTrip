@@ -52,6 +52,16 @@ A web application for planning ham radio park visiting trips using the POTA (Par
 | `POTA_LOG_FILE` | `/tmp/pota_trip_log.txt` | Log file |
 | `POTA_GEOCODE_UA` | `PotaTripPlanner/2.0 (...)` | Nominatim user agent (set your callsign/email if publishing) |
 
+### Debian package (system-wide install)
+
+`make deb` builds a `.deb` into `dist/`; `make install` builds and installs it.
+The package puts the app in `/opt/potatrip` with a self-contained python3
+venv, installs the launcher `/usr/local/bin/potatrip`, and installs, enables
+and starts the systemd service `potatrip` (binds `0.0.0.0:5001` by default).
+
+For changing ports/bind address, firewall port guidance, and reverse-proxy
+setup, see **[docs/systemd-deployment.md](docs/systemd-deployment.md)**.
+
 ## Usage
 
 1. Enter a city name (e.g., "Eustace")

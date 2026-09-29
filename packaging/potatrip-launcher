@@ -1,0 +1,3 @@
+#!/bin/sh
+# POTA Trip Planner launcher — runs the app inside its dedicated venv.
+exec /opt/potatrip/venv/bin/python /opt/potatrip/app.py "$@"

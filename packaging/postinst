@@ -1,0 +1,31 @@
+#!/bin/sh
+# postinst — create the service user/state dir, then enable + start the unit.
+set -e
+
+# Dedicated system user/group (no login shell, no home outside state dir).
+if ! getent group potatrip >/dev/null; then
+    groupadd --system potatrip
+fi
+if ! getent passwd potatrip >/dev/null; then
+    useradd --system --gid potatrip --home-dir /var/lib/potatrip \
+        --shell /usr/sbin/nologin --comment "POTA Trip Planner" potatrip
+fi
+
+# Writable state (park CSV cache, log file).
+install -d -o potatrip -g potatrip /var/lib/potatrip
+
+# Make sure the launcher is executable (dpkg preserves our mode, belt-and-braces).
+chmod 755 /usr/local/bin/potatrip
+
+# Enable and start the systemd service.
+if command -v deb-systemd-helper >/dev/null 2>&1; then
+    deb-systemd-helper unmask potatrip.service >/dev/null || true
+    deb-systemd-helper update potatrip.service >/dev/null || true
+fi
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl --system daemon-reload >/dev/null || true
+    systemctl enable potatrip.service >/dev/null || true
+    systemctl restart potatrip.service || true
+fi
+
+exit 0

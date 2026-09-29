@@ -1,0 +1,24 @@
+#!/bin/sh
+# postrm — disable/remove the systemd unit; keep /var/lib/potatrip on purge? No: purge removes it.
+set -e
+
+case "$1" in
+    remove)
+        systemctl disable --now potatrip.service >/dev/null 2>&1 || true
+        ;;
+    purge)
+        systemctl disable --now potatrip.service >/dev/null 2>&1 || true
+        rm -rf /var/lib/potatrip
+        if getent passwd potatrip >/dev/null; then userdel potatrip || true; fi
+        if getent group potatrip >/dev/null; then groupdel potatrip || true; fi
+        ;;
+esac
+
+if command -v deb-systemd-helper >/dev/null 2>&1; then
+    deb-systemd-helper purge potatrip.service >/dev/null || true
+fi
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl --system daemon-reload >/dev/null || true
+fi
+
+exit 0
