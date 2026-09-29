@@ -516,6 +516,13 @@ HTML_TEMPLATE = '''
             margin-bottom: 20px;
         }
 
+        .hint {
+            display: block;
+            margin-top: 6px;
+            font-size: 0.82em;
+            opacity: 0.75;
+        }
+
         label {
             display: block;
             margin-bottom: 8px;
@@ -746,8 +753,7 @@ HTML_TEMPLATE = '''
             <div class="instructions">
                 <h3>How to Use</h3>
                 <ul>
-                    <li>Enter a city name</li>
-                    <li>Select your state/province</li>
+                    <li>Enter a location anywhere in the world</li>
                     <li>Set radius in miles (default 100)</li>
                     <li>Optionally set hours or miles limits</li>
                     <li>Click "Plan My Trip"</li>
@@ -785,79 +791,13 @@ HTML_TEMPLATE = '''
             
             <form id="tripForm">
                 <div class="form-group">
-                    <label for="city">City:</label>
-                    <input type="text" id="city" name="city" required>
-                </div>
-                
-                <div class="form-group">
-                    <label for="state">State/Province:</label>
-                    <select id="state" name="state" required>
-                        <option value="">Select a location</option>
-                        <option value="US-AL">Alabama (AL)</option>
-                        <option value="US-AK">Alaska (AK)</option>
-                        <option value="US-AZ">Arizona (AZ)</option>
-                        <option value="US-AR">Arkansas (AR)</option>
-                        <option value="US-CA">California (CA)</option>
-                        <option value="US-CO">Colorado (CO)</option>
-                        <option value="US-CT">Connecticut (CT)</option>
-                        <option value="US-DE">Delaware (DE)</option>
-                        <option value="US-FL">Florida (FL)</option>
-                        <option value="US-GA">Georgia (GA)</option>
-                        <option value="US-HI">Hawaii (HI)</option>
-                        <option value="US-ID">Idaho (ID)</option>
-                        <option value="US-IL">Illinois (IL)</option>
-                        <option value="US-IN">Indiana (IN)</option>
-                        <option value="US-IA">Iowa (IA)</option>
-                        <option value="US-KS">Kansas (KS)</option>
-                        <option value="US-KY">Kentucky (KY)</option>
-                        <option value="US-LA">Louisiana (LA)</option>
-                        <option value="US-ME">Maine (ME)</option>
-                        <option value="US-MD">Maryland (MD)</option>
-                        <option value="US-MA">Massachusetts (MA)</option>
-                        <option value="US-MI">Michigan (MI)</option>
-                        <option value="US-MN">Minnesota (MN)</option>
-                        <option value="US-MS">Mississippi (MS)</option>
-                        <option value="US-MO">Missouri (MO)</option>
-                        <option value="US-MT">Montana (MT)</option>
-                        <option value="US-NE">Nebraska (NE)</option>
-                        <option value="US-NV">Nevada (NV)</option>
-                        <option value="US-NH">New Hampshire (NH)</option>
-                        <option value="US-NJ">New Jersey (NJ)</option>
-                        <option value="US-NM">New Mexico (NM)</option>
-                        <option value="US-NY">New York (NY)</option>
-                        <option value="US-NC">North Carolina (NC)</option>
-                        <option value="US-ND">North Dakota (ND)</option>
-                        <option value="US-OH">Ohio (OH)</option>
-                        <option value="US-OK">Oklahoma (OK)</option>
-                        <option value="US-OR">Oregon (OR)</option>
-                        <option value="US-PA">Pennsylvania (PA)</option>
-                        <option value="US-RI">Rhode Island (RI)</option>
-                        <option value="US-SC">South Carolina (SC)</option>
-                        <option value="US-SD">South Dakota (SD)</option>
-                        <option value="US-TN">Tennessee (TN)</option>
-                        <option value="US-TX">Texas (TX)</option>
-                        <option value="US-UT">Utah (UT)</option>
-                        <option value="US-VT">Vermont (VT)</option>
-                        <option value="US-VA">Virginia (VA)</option>
-                        <option value="US-WA">Washington (WA)</option>
-                        <option value="US-WV">West Virginia (WV)</option>
-                        <option value="US-WI">Wisconsin (WI)</option>
-                        <option value="US-WY">Wyoming (WY)</option>
-                        <option value="CA-AB">Alberta (AB)</option>
-                        <option value="CA-BC">British Columbia (BC)</option>
-                        <option value="CA-MB">Manitoba (MB)</option>
-                        <option value="CA-NB">New Brunswick (NB)</option>
-                        <option value="CA-NL">Newfoundland and Labrador (NL)</option>
-                        <option value="CA-NS">Nova Scotia (NS)</option>
-                        <option value="CA-NT">Northwest Territories (NT)</option>
-                        <option value="CA-NU">Nunavut (NU)</option>
-                        <option value="CA-ON">Ontario (ON)</option>
-                        <option value="CA-PE">Prince Edward Island (PE)</option>
-                        <option value="CA-QC">Quebec (QC)</option>
-                        <option value="CA-SK">Saskatchewan (SK)</option>
-                        <option value="CA-YT">Yukon (YT)</option>
-                        <option value="Other">Other (enter manually)</option>
-                    </select>
+                    <label for="location">Location:</label>
+                    <input type="text" id="location" name="location" required
+                           placeholder="City, State/Province, Country"
+                           autocomplete="street-address">
+                    <small class="hint">Anywhere Google Maps can find it —
+                        e.g. "Eustace, TX", "Vancouver, BC, Canada",
+                        "Melbourne, Australia". More detail = more accurate.</small>
                 </div>
                 
                 <div class="form-group">
@@ -955,7 +895,7 @@ HTML_TEMPLATE = '''
                     resultContent.innerHTML = `<div class="error">${esc(result.error)}</div>`;
                     resultDiv.style.display = 'block';
                 } else {
-                    resultCity.textContent = data.city;
+                    resultCity.textContent = data.location || data.city;
                     let parksHTML = '<div class="park-list">';
                     result.parks.forEach((park, index) => {
                         parksHTML += `
@@ -1009,12 +949,23 @@ def plan_trip():
     try:
         data = request.get_json(silent=True) or {}
 
-        city = (data.get('city') or '').strip()
-        if not city:
-            return jsonify({'error': 'Please provide a city name.'}), 400
-        state = data.get('state') or None
-        if state == 'Other':
-            state = None
+        # New freeform API: a single 'location' string ("Eustace, TX",
+        # "Vancouver, BC, Canada", "Melbourne, Australia").
+        # Legacy API ('city' + optional 'state') is still accepted.
+        location = (data.get('location') or '').strip()
+        if not location:
+            city = (data.get('city') or '').strip()
+            if not city:
+                return jsonify({'error': 'Please provide a location '
+                                        '(e.g. "Eustace, TX").'}), 400
+            state = data.get('state') or None
+            if state == 'Other':
+                state = None
+            if state:
+                state, country = normalize_state(state)
+                location = ", ".join(p for p in (city, state, country) if p)
+            else:
+                location = city
 
         radius_value = parse_positive_float(data.get('radius'))
         hours_value = parse_positive_float(data.get('hours'))
@@ -1026,18 +977,19 @@ def plan_trip():
         if radius_value is None:
             radius_value = DEFAULT_RADIUS_MILES
 
-        logger.info("Planning trip for %s (%s): radius=%s hours=%s miles=%s",
-                    city, state, radius_value, hours_value, miles_value)
+        logger.info("Planning trip for %s: radius=%s hours=%s miles=%s",
+                    location, radius_value, hours_value, miles_value)
 
         parks_df = load_parks_from_cache()
         if parks_df.empty:
             return jsonify({'error': 'Could not load park data. '
                                     'Please try again later.'}), 500
 
-        city_coords = geocode_city(city, state)
+        city_coords = geocode_city(location)
         if not city_coords:
-            return jsonify({'error': 'Could not find city coordinates. '
-                                    'Please check the city name and try again.'}), 400
+            return jsonify({'error': 'Could not find location coordinates. '
+                                    'Please check the place name and try '
+                                    'again.'}), 400
 
         # Apply ALL constraints as a funnel (radius always applies).
         nearby_parks = find_nearby_parks(
@@ -1062,13 +1014,14 @@ def plan_trip():
         } for park in nearby_parks]
 
         response_data = {
-            'city': city,
+            'city': location,          # legacy key: full location string
+            'location': location,
             'parkCount': len(parks_data),
             'parks': parks_data,
-            'googleMapsUrl': generate_google_maps_url_with_markers(city,
+            'googleMapsUrl': generate_google_maps_url_with_markers(location,
                                                                   nearby_parks),
         }
-        logger.info("Planned trip: %d parks for %s", len(parks_data), city)
+        logger.info("Planned trip: %d parks for %s", len(parks_data), location)
         return jsonify(response_data)
 
     except Exception as e:

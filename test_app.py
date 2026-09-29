@@ -187,6 +187,68 @@ class TestPlanTripEndpoint:
         r = client.post("/plan_trip", json={})
         assert r.status_code == 400
 
+    def test_freeform_location_accepted(self, client, monkeypatch,
+                                      synthetic_df):
+        monkeypatch.setattr(appmod, "load_parks_from_cache",
+                           lambda: synthetic_df)
+        r = client.post("/plan_trip",
+                       json={"location": "Eustace, TX", "radius": "50"})
+        assert r.status_code == 200
+        assert r.get_json()["location"] == "Eustace, TX"
+
+    def test_freeform_international_accepted(self, client, monkeypatch,
+                                           synthetic_df):
+        monkeypatch.setattr(appmod, "load_parks_from_cache",
+                           lambda: synthetic_df)
+        r = client.post("/plan_trip",
+                       json={"location": "Melbourne, Australia",
+                            "radius": "50"})
+        assert r.status_code == 200
+        assert r.get_json()["location"] == "Melbourne, Australia"
+
+    def test_freeform_passed_to_geocoder_verbatim(self, client, monkeypatch,
+                                               synthetic_df):
+        seen = {}
+
+        def spy(location, *a, **k):
+            seen["arg"] = location
+            return (29.57, -96.56)
+
+        monkeypatch.setattr(appmod, "geocode_city", spy)
+        monkeypatch.setattr(appmod, "load_parks_from_cache",
+                           lambda: synthetic_df)
+        r = client.post("/plan_trip",
+                       json={"location": "Vancouver, BC, Canada",
+                            "radius": "50"})
+        assert r.status_code == 200
+        assert seen["arg"] == "Vancouver, BC, Canada"
+
+    def test_legacy_city_state_still_works(self, client, monkeypatch,
+                                         synthetic_df):
+        seen = {}
+
+        def spy(location, *a, **k):
+            seen["arg"] = location
+            return (29.57, -96.56)
+
+        monkeypatch.setattr(appmod, "geocode_city", spy)
+        monkeypatch.setattr(appmod, "load_parks_from_cache",
+                           lambda: synthetic_df)
+        r = client.post("/plan_trip",
+                       json={"city": "Eustace", "state": "US-TX",
+                            "radius": "50"})
+        assert r.status_code == 200
+        # Legacy US-TX code must be normalized into the location string.
+        assert seen["arg"] == "Eustace, Texas, USA"
+
+    def test_legacy_city_only_works(self, client, monkeypatch, synthetic_df):
+        monkeypatch.setattr(appmod, "load_parks_from_cache",
+                           lambda: synthetic_df)
+        r = client.post("/plan_trip",
+                       json={"city": "Eustace", "radius": "50"})
+        assert r.status_code == 200
+        assert r.get_json()["city"] == "Eustace"
+
     def test_no_positive_constraints(self, client):
         r = client.post("/plan_trip", json={"city": "Eustace", "hours": "0"})
         assert r.status_code == 400
