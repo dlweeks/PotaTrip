@@ -1,4 +1,41 @@
 #!/usr/bin/python3
+# POTATrip — POTA Trip Planner (Flask backend)
+#
+# SPDX-License-Identifier: CDDL-1.1
+#
+# This Source Code Form is subject to the terms of the
+# Common Development and Distribution License, Version 1.1
+# (the "License"). You may not use this file except in
+# compliance with the License.
+#
+# You can obtain a copy of the License at
+#     https://spdx.org/licenses/CDDL-1.1.txt
+# or see the LICENSE file distributed with this project.
+# See the License for the specific language governing
+# permissions and limitations under the License.
+#
+# Copyright (c) 2026 Don L. Weeks <Don.L.Weeks@gmail.com>.
+# All Rights Reserved.
+#
+# ---------------------------------------------------------------------------
+# VERSION HISTORY
+# ---------------------------------------------------------------------------
+# 1.0.0  2026-09-11  Initial commit of PotaTrip web application.
+# 1.1.0  2026-09-18  Trip-planning algorithm iterations; radius filtering.
+# 1.2.0  2026-09-21  Fixed time-constraint algorithm; Purtis Creek inclusion.
+# 1.2.1  2026-09-26  Hour-handling fix; work on ignoring inactive parks.
+# 1.3.0  2026-09-29  Fixed trip math; filter inactive parks (active==1);
+#                    hardened cache (atomic writes, locks, timeouts),
+#                    geocoding (polite UA) and request validation.
+# 1.4.0  2026-09-29  Debian packaging, systemd deployment and
+#                    44net/CGNAT hosting documentation.
+# 1.5.0  2026-09-29  Freeform location entry: one field, worldwide,
+#                    no dropdown (legacy city+state API retained).
+# 1.5.1  2026-09-29  Reject non-settlement geocode matches: invalid city
+#                    names like "Manta, TX" no longer resolve to unrelated
+#                    street/POI coordinates (fixes phantom park results).
+# 1.6.0  2026-09-29  Relicensed under CDDL 1.1; version history added.
+# ---------------------------------------------------------------------------
 """
 POTA Trip Planner — Flask backend.
 
@@ -23,6 +60,7 @@ from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
 
 # ---------------------------------------------------------------- constants
+APP_VERSION = "1.6.0"             # keep in sync with VERSION HISTORY above
 AVG_SPEED_MPH = 40.0          # assumed average driving speed
 ACTIVATION_HOURS = 2.0        # time spent at the park activating
 CACHE_MAX_AGE_DAYS = 7
@@ -1001,6 +1039,7 @@ def index():
 @app.route('/health')
 def health():
     return jsonify({'status': 'ok',
+                   'version': APP_VERSION,
                    'cache_valid': is_cache_valid(),
                    'cache_file': CACHE_FILE})
 

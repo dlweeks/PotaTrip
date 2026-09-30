@@ -104,3 +104,19 @@ Tests run offline against the cached CSV or synthetic frames; geocoding is stubb
 - geopy
 - requests
 - pytest (tests only)
+
+## License
+
+Copyright (c) 2026 Don L. Weeks. All Rights Reserved.
+
+This Source Code Form is subject to the terms of the Common Development and
+Distribution License, Version 1.1 (the "License" / CDDL-1.1). You may not use
+this file except in compliance with the License. A copy of the license is in the
+LICENSE file, or at https://spdx.org/licenses/CDDL-1.1.txt
+
+Note: CDDL 2.0 was checked against SPDX/Open Source Initiative registries and is
+not a registered identifier; CDDL 1.1 is the canonical current CDDL release.
+
+## Version History
+
+See the VERSION HISTORY block at the top of app.py (APP_VERSION constant).
