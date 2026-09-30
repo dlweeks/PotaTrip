@@ -9,6 +9,7 @@ tests never hit Nominatim.
 """
 import math
 import os
+import time
 
 import pandas as pd
 import pytest
@@ -38,6 +39,10 @@ def client(monkeypatch):
     """Flask test client with geocoding stubbed to Eustace, TX."""
     monkeypatch.setattr(appmod, "geocode_city",
                        lambda city, state=None, country=None: (29.57, -96.56))
+    # Generous limiter so the suite doesn't trip the production cap;
+    # rate-limit tests install their own tiny limiter.
+    monkeypatch.setattr(appmod, "_plan_trip_limiter",
+                       appmod._RateLimiter(10000, 60.0))
     appmod.app.config["TESTING"] = True
     return appmod.app.test_client()
 
@@ -394,3 +399,81 @@ class TestGeocodeSettlementGuard:
         r = client.post("/plan_trip",
                        json={"location": "Manta, TX", "radius": "50"})
         assert r.status_code == 400
+
+
+# ------------------------------------------------------- security hardening
+class TestSecurityHardening:
+    """v1.7.0 hardening: caps, sanitizer, rate limit, headers."""
+
+    def test_radius_over_max_rejected(self, client):
+        r = client.post("/plan_trip",
+                       json={"location": "Dallas, TX", "radius": "25000"})
+        assert r.status_code == 400
+
+    def test_hours_over_max_rejected(self, client):
+        r = client.post("/plan_trip",
+                       json={"location": "Dallas, TX", "hours": "100000"})
+        assert r.status_code == 400
+
+    def test_miles_over_max_rejected(self, client):
+        r = client.post("/plan_trip",
+                       json={"location": "Dallas, TX", "miles": "999999"})
+        assert r.status_code == 400
+
+    def test_infinity_rejected(self):
+        assert appmod.parse_positive_float("Infinity") is None
+        assert appmod.parse_positive_float(float("inf")) is None
+
+    def test_parse_respects_max(self):
+        assert appmod.parse_positive_float("100", 500) == 100.0
+        assert appmod.parse_positive_float("600", 500) is None
+
+    def test_sanitize_strips_control_chars(self):
+        out = appmod.sanitize_location("Dallas\x00,\r\n TX\x1b[31m")
+        assert "\x00" not in out and "\r" not in out and "\x1b" not in out
+        assert "Dallas" in out
+
+    def test_sanitize_caps_length(self):
+        out = appmod.sanitize_location("A" * 5000)
+        assert len(out) == appmod.MAX_LOCATION_LEN
+
+    def test_oversized_location_rejected(self, client):
+        r = client.post("/plan_trip",
+                       json={"location": "X" * 5000, "radius": "50"})
+        assert r.status_code == 400
+
+    def test_rate_limit_429(self, client, monkeypatch):
+        monkeypatch.setattr(appmod, "_plan_trip_limiter",
+                           appmod._RateLimiter(3, 60.0))
+        codes = [client.post("/plan_trip",
+                            json={"location": "Dallas, TX",
+                                  "radius": "50"}).status_code
+                 for _ in range(5)]
+        assert codes[:3] == [200, 200, 200]
+        assert all(c == 429 for c in codes[3:])
+
+    def test_rate_limiter_windows_expire(self):
+        rl = appmod._RateLimiter(2, 0.2)
+        assert rl.allow("ip") and rl.allow("ip") and not rl.allow("ip")
+        time.sleep(0.25)
+        assert rl.allow("ip")
+
+    def test_lru_cache_evicts_oldest(self):
+        c = appmod._LRUGeocodeCache(3)
+        c.set("a", 1); c.set("b", 2); c.set("c", 3)
+        c.get("a")                      # touch 'a' so 'b' is oldest
+        c.set("d", 4)
+        assert "b" not in c and "a" in c and "d" in c
+        assert len(c) == 3
+
+    def test_security_headers_present(self, client):
+        r = client.get("/")
+        assert r.headers["X-Content-Type-Options"] == "nosniff"
+        assert r.headers["X-Frame-Options"] == "DENY"
+        csp = r.headers["Content-Security-Policy"]
+        assert "frame-ancestors 'none'" in csp
+        assert "default-src 'self'" in csp
+
+    def test_health_no_path_disclosure(self, client):
+        r = client.get("/health")
+        assert "cache_file" not in r.get_json()

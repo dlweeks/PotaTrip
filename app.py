@@ -35,6 +35,15 @@
 #                    names like "Manta, TX" no longer resolve to unrelated
 #                    street/POI coordinates (fixes phantom park results).
 # 1.6.0  2026-09-29  Relicensed under CDDL 1.1; version history added.
+#                    Author callsign N5SKT credited in headers and UI.
+# 1.7.0  2026-09-29  Security hardening from code review:
+#                    - per-IP rate limiting on /plan_trip (DoS guard)
+#                    - bounded geocode cache (LRU, no memory exhaustion)
+#                    - caps on radius/hours/miles (CPU DoS guard)
+#                    - location length cap + control-char stripping
+#                    - security headers (CSP, X-Frame-Options, nosniff)
+#                    - default cache/log paths moved off shared /tmp
+#                    - /health no longer discloses the cache file path
 # ---------------------------------------------------------------------------
 """
 POTA Trip Planner — Flask backend.
@@ -47,7 +56,9 @@ Google Maps directions URL with the parks as ordered waypoints.
 import io
 import math
 import os
+import re
 import sys
+import time
 import logging
 import threading
 from urllib.parse import quote
@@ -60,15 +71,34 @@ from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
 
 # ---------------------------------------------------------------- constants
-APP_VERSION = "1.6.0"             # keep in sync with VERSION HISTORY above
+APP_VERSION = "1.7.0"             # keep in sync with VERSION HISTORY above
 AVG_SPEED_MPH = 40.0          # assumed average driving speed
 ACTIVATION_HOURS = 2.0        # time spent at the park activating
 CACHE_MAX_AGE_DAYS = 7
 DEFAULT_RADIUS_MILES = 100.0
 MAX_MAP_WAYPOINTS = 10        # parks included in the Google Maps route
 POTA_CSV_URL = "https://pota.app/all_parks_ext.csv"
-CACHE_FILE = os.environ.get("POTA_CACHE_FILE", "/tmp/pota_parks_cache.csv")
-LOG_FILE = os.environ.get("POTA_LOG_FILE", "/tmp/pota_trip_log.txt")
+
+# Security limits (see VERSION HISTORY 1.7.0).
+MAX_RADIUS_MILES = 500.0      # beyond this the whole-planet scan is a DoS
+MAX_TRIP_HOURS = 72.0         # sane upper bounds for user budgets
+MAX_TRIP_MILES = 3000.0
+MAX_LOCATION_LEN = 200        # chars; longer is abuse, not a place name
+GEOCODE_CACHE_MAX = 1000      # LRU cap: attacker-controlled keys, bound it
+RATE_LIMIT_MAX = 30           # /plan_trip requests per window per IP
+RATE_LIMIT_WINDOW_S = 60.0
+
+# Default off shared /tmp (symlink risk on multi-user hosts); override with
+# POTA_CACHE_FILE / POTA_LOG_FILE (the systemd unit already does).
+_USER_CACHE_DIR = os.path.join(
+    os.environ.get("XDG_CACHE_HOME",
+                  os.path.join(os.path.expanduser("~"), ".cache")),
+    "potatrip")
+os.makedirs(_USER_CACHE_DIR, exist_ok=True)
+CACHE_FILE = os.environ.get(
+    "POTA_CACHE_FILE", os.path.join(_USER_CACHE_DIR, "all_parks_ext.csv"))
+LOG_FILE = os.environ.get(
+    "POTA_LOG_FILE", os.path.join(_USER_CACHE_DIR, "pota_trip_log.txt"))
 NOMINATIM_UA = os.environ.get(
     "POTA_GEOCODE_UA",
     "PotaTripPlanner/2.0 (amateur radio trip planner; run locally)",
@@ -91,12 +121,108 @@ _cache_lock = threading.Lock()
 _geocode_cache = {}
 
 
+class _LRUGeocodeCache:
+    """Bounded geocode cache: attacker-controlled keys can't exhaust memory.
+
+    Dict + move-to-end on hit; evicts oldest beyond GEOCODE_CACHE_MAX.
+    Guarded by its own lock (safe under Flask's threaded server).
+    """
+
+    def __init__(self, maxsize):
+        self._data = {}
+        self._order = []
+        self._max = maxsize
+        self._lock = threading.Lock()
+
+    def get(self, key, default=None):
+        with self._lock:
+            if key in self._data:
+                try:
+                    self._order.remove(key)
+                except ValueError:
+                    pass
+                self._order.append(key)
+                return self._data[key]
+            return default
+
+    def __getitem__(self, key):
+        with self._lock:
+            return self._data[key]
+
+    def __setitem__(self, key, value):
+        self.set(key, value)
+
+    def __contains__(self, key):
+        with self._lock:
+            return key in self._data
+
+    def set(self, key, value):
+        with self._lock:
+            if key in self._data:
+                try:
+                    self._order.remove(key)
+                except ValueError:
+                    pass
+            elif len(self._data) >= self._max:
+                oldest = self._order.pop(0)
+                self._data.pop(oldest, None)
+            self._data[key] = value
+            self._order.append(key)
+
+    def clear(self):
+        with self._lock:
+            self._data.clear()
+            self._order.clear()
+
+    def __len__(self):
+        with self._lock:
+            return len(self._data)
+
+
+_geocode_cache = _LRUGeocodeCache(GEOCODE_CACHE_MAX)
+
+
+class _RateLimiter:
+    """Fixed-window per-key rate limiter (per-IP). Thread-safe, no deps.
+
+    Returns True if the request is allowed, False if over the limit.
+    Old windows are pruned on each check so memory stays bounded by the
+    number of active IPs.
+    """
+
+    def __init__(self, max_requests, window_s):
+        self._max = max_requests
+        self._window = window_s
+        self._hits = {}   # key -> [timestamps]
+        self._lock = threading.Lock()
+
+    def allow(self, key):
+        now = time.monotonic()
+        with self._lock:
+            # Prune stale entries globally (cheap: bounded by active IPs).
+            stale = [k for k, ts in self._hits.items()
+                     if not ts or now - ts[-1] > self._window]
+            for k in stale:
+                del self._hits[k]
+            ts = [t for t in self._hits.get(key, []) if now - t <= self._window]
+            if len(ts) >= self._max:
+                self._hits[key] = ts
+                return False
+            ts.append(now)
+            self._hits[key] = ts
+            return True
+
+
+_plan_trip_limiter = _RateLimiter(RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_S)
+
+
 # ---------------------------------------------------------------- validation
-def parse_positive_float(raw):
+def parse_positive_float(raw, max_value=None):
     """Parse a user-supplied constraint to a positive float.
 
     Returns None for empty/missing/invalid/non-positive values so that
     0 and "0" are handled consistently (treated as 'not provided').
+    Values above max_value are also rejected (None) to bound CPU work.
     """
     if raw is None:
         return None
@@ -106,7 +232,28 @@ def parse_positive_float(raw):
         return None
     if math.isnan(value) or value <= 0:
         return None
+    if math.isinf(value):
+        return None
+    if max_value is not None and value > max_value:
+        return None
     return value
+
+
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def sanitize_location(raw):
+    """Sanitize a user-supplied location string.
+
+    Strips control characters (CRLF log-injection, NULs), collapses
+    whitespace, and enforces a length cap. Returns the cleaned string
+    (possibly empty).
+    """
+    if raw is None:
+        return ""
+    s = _CONTROL_CHARS.sub("", str(raw))
+    s = " ".join(s.split())
+    return s[:MAX_LOCATION_LEN]
 
 
 # ---------------------------------------------------------------- cache
@@ -1041,25 +1188,50 @@ def index():
 def health():
     return jsonify({'status': 'ok',
                    'version': APP_VERSION,
-                   'cache_valid': is_cache_valid(),
-                   'cache_file': CACHE_FILE})
+                   'cache_valid': is_cache_valid()})
+
+
+@app.after_request
+def set_security_headers(response):
+    response.headers.setdefault(
+        'Content-Security-Policy',
+        "default-src 'self'; "
+        "img-src 'self' https://images.unsplash.com; "
+        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none'; base-uri 'self'")
+    response.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    response.headers.setdefault('X-Frame-Options', 'DENY')
+    response.headers.setdefault('Referrer-Policy', 'no-referrer')
+    return response
 
 
 @app.route('/plan_trip', methods=['POST'])
 def plan_trip():
     try:
+        # DoS guard: bound requests per client IP.
+        client_ip = (request.headers.get('X-Forwarded-For', '')
+                     .split(',')[0].strip() or request.remote_addr or 'unknown')
+        if not _plan_trip_limiter.allow(client_ip):
+            logger.warning("Rate limit exceeded for %s", client_ip)
+            return jsonify({'error': 'Too many requests. Please slow down.'}), 429
+
         data = request.get_json(silent=True) or {}
 
         # New freeform API: a single 'location' string ("Eustace, TX",
         # "Vancouver, BC, Canada", "Melbourne, Australia").
         # Legacy API ('city' + optional 'state') is still accepted.
-        location = (data.get('location') or '').strip()
+        if len(str(data.get('location') or '')) > MAX_LOCATION_LEN:
+            return jsonify({'error': f'Location too long '
+                                    f'(max {MAX_LOCATION_LEN} chars).'}), 400
+        location = sanitize_location(data.get('location'))
         if not location:
-            city = (data.get('city') or '').strip()
+            city = sanitize_location(data.get('city'))
             if not city:
                 return jsonify({'error': 'Please provide a location '
                                         '(e.g. "Eustace, TX").'}), 400
-            state = data.get('state') or None
+            state = sanitize_location(data.get('state')) or None
             if state == 'Other':
                 state = None
             if state:
@@ -1068,13 +1240,20 @@ def plan_trip():
             else:
                 location = city
 
-        radius_value = parse_positive_float(data.get('radius'))
-        hours_value = parse_positive_float(data.get('hours'))
-        miles_value = parse_positive_float(data.get('miles'))
+        radius_value = parse_positive_float(data.get('radius'),
+                                          MAX_RADIUS_MILES)
+        hours_value = parse_positive_float(data.get('hours'), MAX_TRIP_HOURS)
+        miles_value = parse_positive_float(data.get('miles'), MAX_TRIP_MILES)
+
+        if (data.get('radius') is not None and radius_value is None
+                and parse_positive_float(data.get('radius')) is not None):
+            return jsonify({'error': f'Radius too large '
+                                    f'(max {MAX_RADIUS_MILES:g} miles).'}), 400
 
         if radius_value is None and hours_value is None and miles_value is None:
             return jsonify({'error': 'Please provide at least one positive '
-                                    'constraint (Radius, Hours, or Miles).'}), 400
+                                    'constraint (Radius, Hours, or Miles) '
+                                    'within the allowed limits.'}), 400
         if radius_value is None:
             radius_value = DEFAULT_RADIUS_MILES
 
