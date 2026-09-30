@@ -567,3 +567,53 @@ class TestPlanTripNewAPI:
     def test_no_constraint_400(self, client):
         r = client.post("/plan_trip", json={"location": "Manta, TX"})
         assert r.status_code == 400
+
+
+# ------------------------------------------------- v1.8.1 error UX
+class TestEmptyResultsAndErrors:
+    def test_empty_results_return_200_with_empty_list(self, client, monkeypatch):
+        # Valid location, valid constraint, but no parks nearby:
+        # backend must return 200 + parks: [] (frontend shows the
+        # friendly "no parks fit" message, not an error).
+        monkeypatch.setattr(appmod, "find_nearby_parks",
+                          lambda *a, **k: [])
+        monkeypatch.setattr(appmod, "generate_optimized_trip",
+                          lambda *a, **k: None)
+        r = client.post("/plan_trip",
+                      json={"location": "Somewhere, TX", "mode": "hours",
+                            "value": "1"})
+        assert r.status_code == 200
+        body = r.get_json()
+        assert body["parks"] == []
+        assert body["parkCount"] == 0
+
+    def test_ungeocodable_location_returns_error_json_400(self, client,
+                                                       monkeypatch):
+        monkeypatch.setattr(appmod, "geocode_city",
+                           lambda city, state=None, country=None: None)
+        r = client.post("/plan_trip",
+                       json={"location": "Fairbanks Alask",
+                            "mode": "hours", "value": "4"})
+        assert r.status_code == 400
+        # The JSON error body must exist so the frontend can display it
+        # instead of a generic "network error".
+        assert "error" in r.get_json()
+
+    def test_out_of_range_coords_rejected(self):
+        # Upstream POTA CSV has rows with lat > 90 (e.g. CA-2395).
+        # They must be skipped, not crash geopy with ValueError.
+        assert appmod._park_coords({"latitude": 92.595,
+                                   "longitude": -57.056}) is None
+        assert appmod._park_coords({"latitude": 121.497,
+                                   "longitude": 14.5633}) is None
+        assert appmod._park_coords({"latitude": 29.57,
+                                   "longitude": -181.0}) is None
+        assert appmod._park_coords({"latitude": 29.57,
+                                   "longitude": -96.56}) == (29.57, -96.56)
+
+    def test_bad_csv_rows_do_not_crash_find_nearby(self, synthetic_df):
+        bad = synthetic_df.copy()
+        bad.loc[len(bad)] = ("CA-2395", "Broken Park", 1, 92.595, -57.056)
+        parks = appmod.find_nearby_parks(bad, (21.31, -157.86),
+                                        max_distance_miles=100)
+        assert all(p["reference"] != "CA-2395" for p in parks)

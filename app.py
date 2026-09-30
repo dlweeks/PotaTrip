@@ -36,6 +36,13 @@
 #                    street/POI coordinates (fixes phantom park results).
 # 1.6.0  2026-09-29  Relicensed under CDDL 1.1; version history added.
 #                    Author callsign N5SKT credited in headers and UI.
+# 1.8.1  2026-09-30  Error-UX fixes: frontend now shows the server's
+#                    actual error message instead of a generic "network
+#                    error"; friendly "no parks fit your criteria" message
+#                    for empty results; unit toggle greys out with a
+#                    tooltip in hours mode. Crash fix: reject out-of-range
+#                    coordinates in the upstream POTA CSV (lat > 90 rows
+#                    crashed geopy with ValueError -> HTTP 500).
 # 1.8.0  2026-09-30  Single-choice trip constraint UI (radius / driving
 #                    time / trip distance) + miles-or-kilometers units.
 #                    New API: mode + value + unit (legacy radius/hours/miles
@@ -75,7 +82,7 @@ from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
 
 # ---------------------------------------------------------------- constants
-APP_VERSION = "1.8.0"             # keep in sync with VERSION HISTORY above
+APP_VERSION = "1.8.1"             # keep in sync with VERSION HISTORY above
 AVG_SPEED_MPH = 40.0          # assumed average driving speed
 ACTIVATION_HOURS = 2.0        # time spent at the park activating
 CACHE_MAX_AGE_DAYS = 7
@@ -553,13 +560,20 @@ def geocode_city(city_name, state_or_province=None, country=None):
 
 # ---------------------------------------------------------------- core math
 def _park_coords(park):
-    """Return (lat, lon) for a park dict/row, or None if unusable."""
+    """Return (lat, lon) for a park dict/row, or None if unusable.
+
+    Rejects NaN and out-of-range coordinates: the upstream POTA CSV
+    contains a few rows with latitudes > 90 (bad data), which crash
+    geopy's Point constructor.
+    """
     try:
         lat = float(park["latitude"])
         lon = float(park["longitude"])
     except (KeyError, TypeError, ValueError):
         return None
     if math.isnan(lat) or math.isnan(lon):
+        return None
+    if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lon <= 180.0):
         return None
     return (lat, lon)
 
@@ -1319,6 +1333,11 @@ HTML_TEMPLATE = '''
         function currentUnit() {
             return document.querySelector('input[name="unit"]:checked').value;
         }
+        function modeLabel(mode) {
+            return { radius: 'radius',
+                     hours: 'time budget',
+                     distance: 'trip distance' }[mode] || 'constraint';
+        }
         function refreshModeUI() {
             const mode = currentMode();
             const unit = currentUnit();
@@ -1331,7 +1350,11 @@ HTML_TEMPLATE = '''
                     opt.querySelector('input').checked);
             });
             // Hours are unit-independent: grey out the unit toggle.
-            unitToggle.classList.toggle('disabled', mode === 'hours');
+            const isHours = mode === 'hours';
+            unitToggle.classList.toggle('disabled', isHours);
+            unitToggle.title = isHours
+                ? 'Not applicable: driving time is measured in hours, not distance units.'
+                : '';
             const valueInput = document.getElementById('value');
             valueInput.value = MODE_DEFAULTS[mode][unit];
             valueInput.min = mode === 'hours' ? '0.5' : '1';
@@ -1380,24 +1403,35 @@ HTML_TEMPLATE = '''
                 },
                 body: JSON.stringify(data)
             })
-            .then(response => {
-                if (!response.ok) {
-                    throw new Error(`HTTP error! status: ${response.status}`);
-                }
-                return response.json();
-            })
-            .then(result => {
+            .then(response => response.json()
+                .catch(() => ({}))
+                .then(body => ({ status: response.status, body: body })))
+            .then(({ status, body }) => {
                 const resultCity = document.getElementById('resultCity');
                 const resultContent = document.getElementById('resultContent');
                 const mapsLink = document.getElementById('mapsLink');
-                
-                if (result.error) {
-                    resultContent.innerHTML = `<div class="error">${esc(result.error)}</div>`;
+
+                if (body.error) {
+                    // Show the server's actual error message, not a
+                    // generic "network error" (fixes misleading 400s
+                    // from bad locations or rejected constraints).
+                    resultCity.textContent = data.location || data.city;
+                    resultContent.innerHTML = `<div class="error">${esc(body.error)}</div>`;
+                    resultDiv.style.display = 'block';
+                } else if (status !== 200) {
+                    resultCity.textContent = data.location || data.city;
+                    resultContent.innerHTML = `<div class="error">Server error (HTTP ${status}). Please try again.</div>`;
+                    resultDiv.style.display = 'block';
+                } else if (!body.parks || body.parks.length === 0) {
+                    // Nothing matched — friendly guidance instead of a
+                    // blank results box.
+                    resultCity.textContent = data.location || data.city;
+                    resultContent.innerHTML = `<div class="error">No parks fit your criteria near ${esc(data.location || data.city)}. Try a larger ${esc(modeLabel(currentMode()))}.</div>`;
                     resultDiv.style.display = 'block';
                 } else {
                     resultCity.textContent = data.location || data.city;
                     let parksHTML = '<div class="park-list">';
-                    result.parks.forEach((park, index) => {
+                    body.parks.forEach((park, index) => {
                         parksHTML += `
                             <div class="park-item">
                                 <div class="park-info">
@@ -1411,9 +1445,9 @@ HTML_TEMPLATE = '''
                         `;
                     });
                     parksHTML += '</div>';
-                    
+
                     resultContent.innerHTML = parksHTML;
-                    mapsLink.href = result.googleMapsUrl;
+                    mapsLink.href = body.googleMapsUrl;
                     resultDiv.style.display = 'block';
                 }
             })
