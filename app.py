@@ -14,7 +14,7 @@
 # See the License for the specific language governing
 # permissions and limitations under the License.
 #
-# Copyright (c) 2026 Don L. Weeks <Don.L.Weeks@gmail.com>.
+# Copyright (c) 2026 Don L. Weeks, N5SKT <Don.L.Weeks@gmail.com>.
 # All Rights Reserved.
 #
 # ---------------------------------------------------------------------------
@@ -885,7 +885,8 @@ HTML_TEMPLATE = '''
         <div class="main-content">
             <div class="title-container">
                 <h1>🚀 POTA Trip Planner</h1>
-                <div class="subtitle">Plan Your Ham Radio Adventures Worldwide!</div>
+                <div class="subtitle">Plan Your Ham Radio Adventures Worldwide!
+                    <br><small>by N5SKT</small></div>
             </div>
             
             <form id="tripForm">

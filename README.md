@@ -107,7 +107,7 @@ Tests run offline against the cached CSV or synthetic frames; geocoding is stubb
 
 ## License
 
-Copyright (c) 2026 Don L. Weeks. All Rights Reserved.
+Copyright (c) 2026 Don L. Weeks, N5SKT. All Rights Reserved.
 
 This Source Code Form is subject to the terms of the Common Development and
 Distribution License, Version 1.1 (the "License" / CDDL-1.1). You may not use

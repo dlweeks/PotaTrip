@@ -1,7 +1,7 @@
 """Pytest suite for the POTA Trip Planner.
 
 SPDX-License-Identifier: CDDL-1.1
-Copyright (c) 2026 Don L. Weeks. See LICENSE (CDDL 1.1) for terms.
+Copyright (c) 2026 Don L. Weeks, N5SKT. See LICENSE (CDDL 1.1) for terms.
 
 Runs against the real cached POTA CSV when available (fast, no network);
 falls back to synthetic frames otherwise. Geocoding is monkeypatched so
