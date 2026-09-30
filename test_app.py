@@ -477,3 +477,93 @@ class TestSecurityHardening:
     def test_health_no_path_disclosure(self, client):
         r = client.get("/health")
         assert "cache_file" not in r.get_json()
+
+
+# ------------------------------------------------- v1.8.0 modes and units
+class TestConstraintModes:
+    def test_radius_mode_miles(self):
+        r, h, m, err = appmod.resolve_constraint(
+            {"mode": "radius", "value": "50", "unit": "mi"})
+        assert err is None and r == 50.0 and h is None and m is None
+
+    def test_radius_mode_km_converts(self):
+        r, h, m, err = appmod.resolve_constraint(
+            {"mode": "radius", "value": "160", "unit": "km"})
+        assert err is None
+        assert abs(r - 160 * appmod.KM_PER_MILE) < 1e-6
+
+    def test_radius_km_over_cap_rejected(self):
+        # 1000 km = 621 mi > 500 mi cap
+        r, h, m, err = appmod.resolve_constraint(
+            {"mode": "radius", "value": "1000", "unit": "km"})
+        assert r is None and err is not None
+
+    def test_hours_mode(self):
+        r, h, m, err = appmod.resolve_constraint(
+            {"mode": "hours", "value": "6"})
+        assert err is None and h == 6.0 and r is None and m is None
+
+    def test_hours_over_cap_rejected(self):
+        r, h, m, err = appmod.resolve_constraint(
+            {"mode": "hours", "value": "100"})
+        assert h is None and err is not None
+
+    def test_distance_mode_km(self):
+        r, h, m, err = appmod.resolve_constraint(
+            {"mode": "distance", "value": "300", "unit": "km"})
+        assert err is None and m is not None
+        assert abs(m - 300 * appmod.KM_PER_MILE) < 1e-6
+
+    def test_unknown_mode_rejected(self):
+        r, h, m, err = appmod.resolve_constraint(
+            {"mode": "vibes", "value": "5"})
+        assert err is not None
+
+    def test_unknown_unit_rejected(self):
+        r, h, m, err = appmod.resolve_constraint(
+            {"mode": "radius", "value": "5", "unit": "furlongs"})
+        assert err is not None
+
+    def test_missing_value_rejected(self):
+        r, h, m, err = appmod.resolve_constraint({"mode": "radius"})
+        assert err is not None
+
+    def test_legacy_fields_still_work(self):
+        r, h, m, err = appmod.resolve_constraint(
+            {"radius": "30", "hours": "5"})
+        assert err is None and r == 30.0 and h == 5.0 and m is None
+
+    def test_legacy_km_unit_applies_to_radius_and_miles(self):
+        r, h, m, err = appmod.resolve_constraint(
+            {"radius": "160", "miles": "320", "unit": "km"})
+        assert err is None
+        assert abs(r - 160 * appmod.KM_PER_MILE) < 1e-6
+        assert abs(m - 320 * appmod.KM_PER_MILE) < 1e-6
+
+    def test_to_miles_passthrough(self):
+        assert appmod.to_miles(10, "mi") == 10
+        assert abs(appmod.to_miles(10, "km") - 16.09344) < 1e-6
+
+
+class TestPlanTripNewAPI:
+    def test_radius_km_endpoint(self, client):
+        r = client.post("/plan_trip",
+                       json={"location": "Manta, TX", "mode": "radius",
+                             "value": "80", "unit": "km"})
+        assert r.status_code == 200
+
+    def test_hours_mode_endpoint(self, client):
+        r = client.post("/plan_trip",
+                       json={"location": "Manta, TX", "mode": "hours",
+                             "value": "5"})
+        assert r.status_code == 200
+
+    def test_bad_mode_400(self, client):
+        r = client.post("/plan_trip",
+                       json={"location": "Manta, TX", "mode": "nope",
+                             "value": "5"})
+        assert r.status_code == 400
+
+    def test_no_constraint_400(self, client):
+        r = client.post("/plan_trip", json={"location": "Manta, TX"})
+        assert r.status_code == 400

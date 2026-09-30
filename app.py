@@ -36,6 +36,10 @@
 #                    street/POI coordinates (fixes phantom park results).
 # 1.6.0  2026-09-29  Relicensed under CDDL 1.1; version history added.
 #                    Author callsign N5SKT credited in headers and UI.
+# 1.8.0  2026-09-30  Single-choice trip constraint UI (radius / driving
+#                    time / trip distance) + miles-or-kilometers units.
+#                    New API: mode + value + unit (legacy radius/hours/miles
+#                    fields still accepted).
 # 1.7.0  2026-09-29  Security hardening from code review:
 #                    - per-IP rate limiting on /plan_trip (DoS guard)
 #                    - bounded geocode cache (LRU, no memory exhaustion)
@@ -71,7 +75,7 @@ from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
 
 # ---------------------------------------------------------------- constants
-APP_VERSION = "1.7.0"             # keep in sync with VERSION HISTORY above
+APP_VERSION = "1.8.0"             # keep in sync with VERSION HISTORY above
 AVG_SPEED_MPH = 40.0          # assumed average driving speed
 ACTIVATION_HOURS = 2.0        # time spent at the park activating
 CACHE_MAX_AGE_DAYS = 7
@@ -254,6 +258,93 @@ def sanitize_location(raw):
     s = _CONTROL_CHARS.sub("", str(raw))
     s = " ".join(s.split())
     return s[:MAX_LOCATION_LEN]
+
+
+# ------------------------------------------------------- constraint modes
+# v1.8.0: the UI sends exactly ONE constraint: mode + value + unit.
+#   mode: "radius"  — straight-line distance from the location
+#         "hours"   — round-trip driving time + activation per park
+#         "distance"— round-trip mileage per park
+#   unit: "mi" (default) or "km".
+# Legacy clients sending radius/hours/miles directly still work.
+
+VALID_MODES = ("radius", "hours", "distance")
+KM_PER_MILE = 1.609344
+
+
+def to_miles(value, unit):
+    """Convert a distance value in `unit` ('mi'|'km') to miles."""
+    if unit == "km":
+        return value * KM_PER_MILE
+    return value
+
+
+def resolve_constraint(data):
+    """Resolve the request's single constraint into (radius, hours, miles)
+    in internal (mile) units.
+
+    Returns (radius_value, hours_value, miles_value, error).
+    On new-style input exactly one of the three is set (radius always set
+    as the coarse funnel). On legacy input the three raw fields pass
+    through with unit conversion applied if a unit is given.
+    """
+    mode = (data.get("mode") or "").strip().lower() or None
+    unit = (data.get("unit") or "mi").strip().lower()
+    if unit not in ("mi", "km"):
+        return None, None, None, "Unknown unit (use 'mi' or 'km')."
+
+    if mode:
+        if mode not in VALID_MODES:
+            return None, None, None, (f"Unknown mode '{mode}' "
+                                    f"(use radius, hours, or distance).")
+        raw = data.get("value")
+        if raw is None:
+            return None, None, None, "No value provided for the constraint."
+        if mode == "hours":
+            v = parse_positive_float(raw, MAX_TRIP_HOURS)  # unit-free
+            if v is None:
+                return None, None, None, (f"Hours too large or invalid "
+                                        f"(max {MAX_TRIP_HOURS:g}).")
+            # find_nearby_parks converts the hours budget to a radius
+            # itself; no funnel needed here.
+            return None, v, None, None
+        v = parse_positive_float(raw)
+        if v is None:
+            return None, None, None, "Constraint value must be a positive number."
+        v_mi = to_miles(v, unit)
+        if mode == "radius":
+            if v_mi > MAX_RADIUS_MILES:
+                return None, None, None, (
+                    f"Radius too large (max {MAX_RADIUS_MILES:g} mi / "
+                    f"{MAX_RADIUS_MILES * KM_PER_MILE:g} km).")
+            return v_mi, None, None, None
+        # distance mode: round-trip budget per park.
+        if v_mi > MAX_TRIP_MILES:
+            return None, None, None, (
+                f"Trip distance too large (max {MAX_TRIP_MILES:g} mi / "
+                f"{MAX_TRIP_MILES * KM_PER_MILE:g} km).")
+        return None, None, v_mi, None
+
+    # ---- legacy path: raw radius/hours/miles fields (miles assumed unless
+    # a unit is supplied, which applies to radius and miles).
+    radius_value = parse_positive_float(to_miles_arg(data.get("radius"), unit),
+                                      MAX_RADIUS_MILES)
+    hours_value = parse_positive_float(data.get("hours"), MAX_TRIP_HOURS)
+    miles_value = parse_positive_float(to_miles_arg(data.get("miles"), unit),
+                                     MAX_TRIP_MILES)
+    return radius_value, hours_value, miles_value, None
+
+
+def to_miles_arg(raw, unit):
+    """Convert a raw user distance field to miles if it parses and unit=km.
+
+    Non-numeric input passes through untouched so parse_positive_float
+    produces its usual None.
+    """
+    if unit != "km" or raw is None:
+        return raw
+    v = parse_positive_float(raw)
+    return to_miles(v, unit) if v is not None else raw
 
 
 # ---------------------------------------------------------------- cache
@@ -762,6 +853,91 @@ HTML_TEMPLATE = '''
             margin-bottom: 20px;
         }
 
+        .mode-selector {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 12px;
+        }
+
+        .mode-option {
+            flex: 1;
+            border: 2px solid var(--border-color, #d0d7e2);
+            border-radius: 10px;
+            padding: 10px 12px;
+            cursor: pointer;
+            transition: border-color 0.2s, background-color 0.2s;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        .mode-option:hover {
+            border-color: var(--accent-color-1, #4a7cf0);
+        }
+
+        .mode-option.selected {
+            border-color: var(--accent-color-1, #4a7cf0);
+            background-color: rgba(74, 124, 240, 0.10);
+        }
+
+        .mode-option input[type="radio"] {
+            margin-bottom: 4px;
+            accent-color: var(--accent-color-1, #4a7cf0);
+        }
+
+        .mode-title {
+            font-weight: 700;
+            font-size: 0.95rem;
+        }
+
+        .mode-desc {
+            font-size: 0.78rem;
+            opacity: 0.75;
+        }
+
+        .value-row {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .value-row input[type="number"] {
+            width: 140px;
+        }
+
+        .unit-toggle {
+            display: inline-flex;
+            border: 2px solid var(--border-color, #d0d7e2);
+            border-radius: 10px;
+            overflow: hidden;
+        }
+
+        .unit-option {
+            padding: 8px 14px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: background-color 0.2s;
+            user-select: none;
+        }
+
+        .unit-option + .unit-option {
+            border-left: 2px solid var(--border-color, #d0d7e2);
+        }
+
+        .unit-option.selected {
+            background-color: var(--accent-color-1, #4a7cf0);
+            color: #fff;
+        }
+
+        .unit-option input[type="radio"] {
+            display: none;
+        }
+
+        .unit-toggle.disabled {
+            opacity: 0.4;
+            pointer-events: none;
+        }
+
         .hint {
             display: block;
             margin-top: 6px;
@@ -1048,18 +1224,46 @@ HTML_TEMPLATE = '''
                 </div>
                 
                 <div class="form-group">
-                    <label for="radius">Radius (miles):</label>
-                    <input type="number" id="radius" name="radius" value="100" min="1">
-                </div>
-                
-                <div class="form-group">
-                    <label for="hours">Hours (optional):</label>
-                    <input type="number" id="hours" name="hours" step="0.1" min="0">
-                </div>
-                
-                <div class="form-group">
-                    <label for="miles">Trip Miles (optional):</label>
-                    <input type="number" id="miles" name="miles" step="0.1" min="0">
+                    <label>Trip limit — choose one:</label>
+                    <div class="mode-selector" role="radiogroup"
+                         aria-label="Trip constraint type">
+                        <label class="mode-option">
+                            <input type="radio" name="mode" value="radius"
+                                   checked>
+                            <span class="mode-title">Radius</span>
+                            <span class="mode-desc">Straight-line distance
+                                from your location</span>
+                        </label>
+                        <label class="mode-option">
+                            <input type="radio" name="mode" value="hours">
+                            <span class="mode-title">Driving time</span>
+                            <span class="mode-desc">Round trip + 2h
+                                activation per park</span>
+                        </label>
+                        <label class="mode-option">
+                            <input type="radio" name="mode" value="distance">
+                            <span class="mode-title">Trip distance</span>
+                            <span class="mode-desc">Round-trip distance
+                                per park</span>
+                        </label>
+                    </div>
+                    <div class="value-row">
+                        <input type="number" id="value" name="value"
+                               value="100" min="1" step="any"
+                               aria-label="Constraint value">
+                        <div class="unit-toggle" role="radiogroup"
+                             aria-label="Distance unit">
+                            <label class="unit-option">
+                                <input type="radio" name="unit" value="mi"
+                                       checked> Miles
+                            </label>
+                            <label class="unit-option">
+                                <input type="radio" name="unit" value="km">
+                                Kilometers
+                            </label>
+                        </div>
+                    </div>
+                    <small class="hint" id="modeHint"></small>
                 </div>
                 
                 <button type="submit">Plan My Trip</button>
@@ -1095,6 +1299,55 @@ HTML_TEMPLATE = '''
                 document.body.classList.add('dark-mode');
             }
         });
+
+        // ---- v1.8.0: single-choice constraint + unit toggle ----
+        const MODE_DEFAULTS = {
+            radius:   { mi: 100, km: 160 },
+            hours:    { mi: 4,   km: 4   },   // hours: unit-independent
+            distance: { mi: 150, km: 240 }
+        };
+        const MODE_HINTS = {
+            radius: 'How far from your location to look for parks (as the crow flies).',
+            hours: 'Total time budget per park: round-trip driving at ~40 mph plus a 2-hour activation stop.',
+            distance: 'Maximum round-trip driving distance per park.'
+        };
+        const unitToggle = document.querySelector('.unit-toggle');
+
+        function currentMode() {
+            return document.querySelector('input[name="mode"]:checked').value;
+        }
+        function currentUnit() {
+            return document.querySelector('input[name="unit"]:checked').value;
+        }
+        function refreshModeUI() {
+            const mode = currentMode();
+            const unit = currentUnit();
+            document.querySelectorAll('.mode-option').forEach(opt => {
+                opt.classList.toggle('selected',
+                    opt.querySelector('input').checked);
+            });
+            document.querySelectorAll('.unit-option').forEach(opt => {
+                opt.classList.toggle('selected',
+                    opt.querySelector('input').checked);
+            });
+            // Hours are unit-independent: grey out the unit toggle.
+            unitToggle.classList.toggle('disabled', mode === 'hours');
+            const valueInput = document.getElementById('value');
+            valueInput.value = MODE_DEFAULTS[mode][unit];
+            valueInput.min = mode === 'hours' ? '0.5' : '1';
+            valueInput.step = mode === 'hours' ? '0.5' : 'any';
+            document.getElementById('modeHint').textContent = MODE_HINTS[mode];
+        }
+        document.querySelectorAll('input[name="mode"], input[name="unit"]')
+            .forEach(el => el.addEventListener('change', refreshModeUI));
+        refreshModeUI();
+
+        function fmtDistance(miles) {
+            if (currentUnit() === 'km') {
+                return (miles * 1.609344).toFixed(1) + ' km';
+            }
+            return miles.toFixed(1) + ' mi';
+        }
 
         document.getElementById('tripForm').addEventListener('submit', function(e) {
             e.preventDefault();
@@ -1153,7 +1406,7 @@ HTML_TEMPLATE = '''
                                     <br>
                                     <span class="park-reference">${esc(park.reference)}</span>
                                 </div>
-                                <div class="park-distance">${park.distance.toFixed(1)} miles</div>
+                                <div class="park-distance">${fmtDistance(park.distance)}</div>
                             </div>
                         `;
                     });
@@ -1240,20 +1493,14 @@ def plan_trip():
             else:
                 location = city
 
-        radius_value = parse_positive_float(data.get('radius'),
-                                          MAX_RADIUS_MILES)
-        hours_value = parse_positive_float(data.get('hours'), MAX_TRIP_HOURS)
-        miles_value = parse_positive_float(data.get('miles'), MAX_TRIP_MILES)
-
-        if (data.get('radius') is not None and radius_value is None
-                and parse_positive_float(data.get('radius')) is not None):
-            return jsonify({'error': f'Radius too large '
-                                    f'(max {MAX_RADIUS_MILES:g} miles).'}), 400
+        radius_value, hours_value, miles_value, err = resolve_constraint(data)
+        if err:
+            return jsonify({'error': err}), 400
 
         if radius_value is None and hours_value is None and miles_value is None:
-            return jsonify({'error': 'Please provide at least one positive '
-                                    'constraint (Radius, Hours, or Miles) '
-                                    'within the allowed limits.'}), 400
+            return jsonify({'error': 'Please provide a trip constraint '\
+                                    '(radius, driving hours, or trip '\
+                                    'distance) within the allowed limits.'}), 400
         if radius_value is None:
             radius_value = DEFAULT_RADIUS_MILES
 
