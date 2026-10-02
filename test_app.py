@@ -639,9 +639,19 @@ class TestRoadTrip:
         assert "origin=start" in body["googleMapsUrl"]
         assert "destination=end" in body["googleMapsUrl"]
         assert "waypoints=" in body["googleMapsUrl"]
-        # Parks ordered by progress; each has off_route_miles.
-        assert body["parks"][0]["name"] == "Close Park"
-        assert "off_route_miles" in body["parks"][0]
+        # Parks ordered by progress; each has off_route_miles, coords,
+        # and a POTA page link.
+        first = body["parks"][0]
+        assert first["name"] == "Close Park"
+        assert "off_route_miles" in first
+        assert "latitude" in first and "longitude" in first
+        assert first["potaUrl"].startswith("https://pota.app/#/park/")
+        assert first["reference"] in first["potaUrl"]
+
+    def test_road_trip_candidates_exceed_stop_cap(self):
+        # The API offers more candidates than the Google waypoint cap so
+        # the user has real choices.
+        assert appmod.ROAD_TRIP_CANDIDATES > appmod.ROAD_TRIP_MAX_PARKS
 
     def test_endpoint_bad_origin_400(self, client, monkeypatch):
         monkeypatch.setattr(appmod, "load_parks_from_cache",

@@ -124,6 +124,7 @@ DEFAULT_CORRIDOR_MILES = 25.0   # how far off the road a park may sit
 MAX_CORRIDOR_MILES = 100.0
 MAX_ROAD_TRIP_MILES = 3000.0  # same sanity bound as trip distance
 ROAD_TRIP_MAX_PARKS = 10        # Google Maps waypoint cap
+ROAD_TRIP_CANDIDATES = 30       # parks offered for selection (user picks <=10)
 
 # Default off shared /tmp (symlink risk on multi-user hosts); override with
 # POTA_CACHE_FILE / POTA_LOG_FILE (the systemd unit already does).
@@ -1425,6 +1426,32 @@ HTML_TEMPLATE = '''
             margin: 10px 0;
             font-weight: 600;
         }
+
+        .park-select {
+            display: flex;
+            align-items: center;
+            margin-right: 12px;
+            cursor: pointer;
+        }
+
+        .park-select input[type="checkbox"] {
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+        }
+
+        #buildRouteBtn {
+            margin-top: 12px;
+            width: auto;
+            padding: 12px 28px;
+            font-size: 16px;
+        }
+
+        #buildRouteBtn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
     </style>
 </head>
 <body>
@@ -1603,8 +1630,15 @@ HTML_TEMPLATE = '''
                     <h2 id="roadResultTitle">Road trip</h2>
                     <div id="roadSummary" class="hint"></div>
                     <div id="roadContent"></div>
+                    <div id="roadSelectionBar" hidden>
+                        <small class="hint" id="selectionCount"></small>
+                        <button type="button" id="buildRouteBtn"
+                                onclick="buildSelectedRoute()">
+                            Add Selected Parks to Trip
+                        </button>
+                    </div>
                     <a id="roadMapsLink" class="google-maps-link" href="#"
-                       target="_blank">View route on Google Maps</a>
+                       target="_blank" hidden>View route on Google Maps</a>
                 </div>
             </div><!-- /panelRoad -->
         </div>
@@ -1785,6 +1819,9 @@ HTML_TEMPLATE = '''
         });
 
         // ---- v2.0.0: Road Trip tab (point-to-point, parks along route) ----
+        let roadState = { origin: '', destination: '', parks: [] };
+        const MAX_STOPS = 10;   // Google Maps waypoint limit
+
         function switchTab(which) {
             const isHome = which === 'home';
             document.getElementById('panelHome').hidden = !isHome;
@@ -1844,6 +1881,9 @@ HTML_TEMPLATE = '''
                 const title = document.getElementById('roadResultTitle');
                 const summary = document.getElementById('roadSummary');
                 const mapsLink = document.getElementById('roadMapsLink');
+                const selBar = document.getElementById('roadSelectionBar');
+                mapsLink.hidden = true;
+                selBar.hidden = true;
                 if (body.error) {
                     title.textContent = 'Road trip';
                     summary.textContent = '';
@@ -1858,25 +1898,38 @@ HTML_TEMPLATE = '''
                         `~${body.routeDurationHours.toFixed(1)} h driving. ` +
                         `No parks found within ${fmtRoadDist(body.corridorMiles)} ` +
                         `of the road. Try a wider corridor.`;
-                    mapsLink.href = body.googleMapsUrl;
                     resultDiv.style.display = 'block';
                 } else {
+                    roadState = {
+                        origin: body.origin,
+                        destination: body.destination,
+                        parks: body.parks,
+                    };
                     title.textContent =
                         `${esc(body.origin)} → ${esc(body.destination)}`;
                     summary.textContent =
                         `Route: ${fmtRoadDist(body.routeDistanceMiles)} · ` +
                         `~${body.routeDurationHours.toFixed(1)} h driving · ` +
-                        `${body.parkCount} park stop(s) within ` +
-                        `${fmtRoadDist(body.corridorMiles)} of the road`;
+                        `${body.parkCount} park(s) found within ` +
+                        `${fmtRoadDist(body.corridorMiles)} of the road. ` +
+                        `Tick the ones you want as stops (max ${MAX_STOPS}).`;
                     let html = '<div class="park-list">';
                     body.parks.forEach((park, index) => {
                         html += `
                             <div class="park-item">
+                                <label class="park-select">
+                                    <input type="checkbox" class="park-check"
+                                           data-index="${index}"
+                                           onchange="updateSelectionCount()">
+                                </label>
                                 <div class="park-info">
-                                    <span class="park-number-marker">${index + 1}</span>
                                     <span class="park-name">${esc(park.name)}</span>
                                     <br>
                                     <span class="park-reference">${esc(park.reference)}</span>
+                                    &nbsp;·&nbsp;
+                                    <a href="${esc(park.potaUrl)}"
+                                       target="_blank"
+                                       rel="noopener noreferrer">POTA page</a>
                                 </div>
                                 <div class="park-distance">${fmtRoadDist(park.off_route_miles)} off route</div>
                             </div>
@@ -1884,7 +1937,8 @@ HTML_TEMPLATE = '''
                     });
                     html += '</div>';
                     content.innerHTML = html;
-                    mapsLink.href = body.googleMapsUrl;
+                    selBar.hidden = false;
+                    updateSelectionCount();
                     resultDiv.style.display = 'block';
                 }
             })
@@ -1898,6 +1952,55 @@ HTML_TEMPLATE = '''
                 submitButton.disabled = false;
             });
         });
+
+        function selectedParks() {
+            const picked = [];
+            document.querySelectorAll('.park-check:checked')
+                .forEach(cb => {
+                    const idx = parseInt(cb.dataset.index, 10);
+                    if (!isNaN(idx) && roadState.parks[idx]) {
+                        picked.push(roadState.parks[idx]);
+                    }
+                });
+            return picked;
+        }
+
+        function updateSelectionCount() {
+            const n = selectedParks().length;
+            const count = document.getElementById('selectionCount');
+            const btn = document.getElementById('buildRouteBtn');
+            if (n > MAX_STOPS) {
+                count.textContent =
+                    `${n} parks selected — too many! Google Maps allows ` +
+                    `a maximum of ${MAX_STOPS} stops. Untick ` +
+                    `${n - MAX_STOPS} more.`;
+                btn.disabled = true;
+            } else if (n === 0) {
+                count.textContent = 'No parks selected yet.';
+                btn.disabled = true;
+            } else {
+                count.textContent =
+                    `${n} of ${roadState.parks.length} parks selected.`;
+                btn.disabled = false;
+            }
+        }
+
+        function buildSelectedRoute() {
+            const picked = selectedParks();
+            if (picked.length === 0 || picked.length > MAX_STOPS) return;
+            const waypoints = picked.map(p => `${p.latitude},${p.longitude}`);
+            const url = 'https://www.google.com/maps/dir/?api=1'
+                + '&origin=' + encodeURIComponent(roadState.origin)
+                + '&destination=' + encodeURIComponent(roadState.destination)
+                + '&waypoints=' + encodeURIComponent(waypoints.join('|'));
+            const mapsLink = document.getElementById('roadMapsLink');
+            mapsLink.href = url;
+            mapsLink.hidden = false;
+            mapsLink.textContent =
+                `View route on Google Maps (${picked.length} stop` +
+                `${picked.length === 1 ? '' : 's'})`;
+            mapsLink.focus();
+        }
     </script>
 </body>
 </html>
@@ -2097,7 +2200,13 @@ def road_trip():
             'reference': p.get('reference', 'Unknown'),
             'off_route_miles': round(p['off_route_miles'], 1),
             'progress': round(p['progress'], 3),
-        } for p in parks[:ROAD_TRIP_MAX_PARKS]]
+            'latitude': round(p['latitude'], 6),
+            'longitude': round(p['longitude'], 6),
+            # Deterministic POTA park page (contains the park's website,
+            # activator log, and details). No preprocessing needed.
+            'potaUrl': ("https://pota.app/#/park/"
+                       + str(p.get('reference', ''))),
+        } for p in parks[:ROAD_TRIP_CANDIDATES]]
 
         response_data = {
             'origin': origin,
