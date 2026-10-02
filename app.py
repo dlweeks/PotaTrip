@@ -1604,7 +1604,7 @@ HTML_TEMPLATE = '''
                             the road to look for parks):</label>
                         <div class="value-row">
                             <input type="number" id="corridor" name="corridor"
-                                   value="25" min="1" step="5"
+                                   value="25" min="1" step="any"
                                    aria-label="Corridor width">
                             <div class="unit-toggle" id="roadUnitToggle"
                                  role="radiogroup" aria-label="Distance unit">
