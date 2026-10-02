@@ -479,6 +479,96 @@ class TestSecurityHardening:
         assert "cache_file" not in r.get_json()
 
 
+# ------------------------------------------- configurable activation hours
+class TestActivationHours:
+    """v1.9.0: user-supplied hours-per-park instead of the fixed 2h."""
+
+    def test_trip_hours_uses_custom_activation(self):
+        # 40 mi one-way = 2h round-trip driving
+        assert appmod.trip_hours_for_park(40) == 4.0          # default 2h
+        assert appmod.trip_hours_for_park(40, 3.0) == 5.0     # custom 3h
+        assert appmod.trip_hours_for_park(40, 1.0) == 3.0
+
+    def test_find_nearby_parks_honours_activation(self, synthetic_df):
+        home = (29.57, -96.56)
+        # Mid Park ~21 mi one-way: round trip 1.05h drive.
+        # 4h budget with 2h activation: fits (3.05 <= 4).
+        assert len(appmod.find_nearby_parks(
+            synthetic_df, home, max_hours=4.0)) >= 2
+        # 3h budget with 3h activation per park: Mid Park needs 4.05h -> out.
+        names_3h = [p["name"] for p in appmod.find_nearby_parks(
+            synthetic_df, home, max_hours=3.0, activation_hours=3.0)]
+        assert "Mid Park" not in names_3h
+        # Same 3h budget with 0.5h activation: Mid Park needs 1.55h -> in.
+        names_half = [p["name"] for p in appmod.find_nearby_parks(
+            synthetic_df, home, max_hours=3.0, activation_hours=0.5)]
+        assert "Mid Park" in names_half
+
+    def test_optimizer_honours_activation(self, synthetic_df):
+        home = (29.57, -96.56)
+        parks = appmod.find_nearby_parks(synthetic_df, home,
+                                        max_distance_miles=100)
+        # Tight budget: with 3h activation per park, fewer parks fit than
+        # with 0.5h activation.
+        tight_3h = appmod.generate_optimized_trip(
+            list(parks), home, max_hours=6.0, activation_hours=3.0)
+        tight_half = appmod.generate_optimized_trip(
+            list(parks), home, max_hours=6.0, activation_hours=0.5)
+        assert len(tight_3h) <= len(tight_half)
+
+    def test_api_accepts_activation_hours(self, client, monkeypatch,
+                                        synthetic_df):
+        monkeypatch.setattr(appmod, "load_parks_from_cache",
+                           lambda: synthetic_df)
+        r = client.post("/plan_trip", json={
+            "location": "Eustace, TX", "mode": "hours", "value": "3",
+            "activation_hours": "3"})
+        assert r.status_code == 200
+        names = [p["name"] for p in r.get_json()["parks"]]
+        assert "Mid Park" not in names   # 21mi*2/40 + 3h = 4.05h > 3h
+
+    def test_api_default_activation_unchanged(self, client, monkeypatch,
+                                            synthetic_df):
+        monkeypatch.setattr(appmod, "load_parks_from_cache",
+                           lambda: synthetic_df)
+        # 3h budget, default 2h activation: Mid Park needs 3.05h -> out.
+        r = client.post("/plan_trip", json={
+            "location": "Eustace, TX", "mode": "hours", "value": "3"})
+        assert r.status_code == 200
+        names = [p["name"] for p in r.get_json()["parks"]]
+        assert "Mid Park" not in names
+        # 5h budget, default 2h activation: both parks fit in one route.
+        # (4h is not enough: Close Park uses ~2.1h, adding Mid Park
+        # projects to ~4.95h with the drive home.)
+        r = client.post("/plan_trip", json={
+            "location": "Eustace, TX", "mode": "hours", "value": "5"})
+        names = [p["name"] for p in r.get_json()["parks"]]
+        assert "Mid Park" in names
+
+    def test_api_activation_over_max_rejected(self, client):
+        r = client.post("/plan_trip", json={
+            "location": "Eustace, TX", "mode": "hours", "value": "8",
+            "activation_hours": "25"})
+        assert r.status_code == 400
+        assert "Activation hours" in r.get_json()["error"]
+
+    def test_api_activation_invalid_rejected(self, client):
+        r = client.post("/plan_trip", json={
+            "location": "Eustace, TX", "mode": "hours", "value": "8",
+            "activation_hours": "abc"})
+        assert r.status_code == 400
+
+    def test_legacy_api_accepts_activation_hours(self, client, monkeypatch,
+                                              synthetic_df):
+        monkeypatch.setattr(appmod, "load_parks_from_cache",
+                           lambda: synthetic_df)
+        r = client.post("/plan_trip", json={
+            "city": "Eustace", "hours": "3", "activation_hours": "3"})
+        assert r.status_code == 200
+        names = [p["name"] for p in r.get_json()["parks"]]
+        assert "Mid Park" not in names
+
+
 # ------------------------------------------------- v1.8.0 modes and units
 class TestConstraintModes:
     def test_radius_mode_miles(self):

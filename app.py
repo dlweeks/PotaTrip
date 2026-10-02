@@ -55,6 +55,14 @@
 #                    - security headers (CSP, X-Frame-Options, nosniff)
 #                    - default cache/log paths moved off shared /tmp
 #                    - /health no longer discloses the cache file path
+# 1.8.0  2026-09-30  Single-choice trip constraint UI (radius / driving
+#                    time / trip distance) + miles/km unit toggle.
+# 1.8.1  2026-09-30  Error-UX fixes (show server error messages, friendly
+#                    empty-result guidance) + bad-coordinate crash fix.
+# 1.9.0  2026-10-02  Configurable activation hours per park: new optional
+#                    'activation_hours' input (0.5-12h, default 2) shown
+#                    in Driving-time mode; flows through trip_hours_for_park,
+#                    find_nearby_parks and generate_optimized_trip.
 # ---------------------------------------------------------------------------
 """
 POTA Trip Planner — Flask backend.
@@ -82,9 +90,10 @@ from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
 
 # ---------------------------------------------------------------- constants
-APP_VERSION = "1.8.1"             # keep in sync with VERSION HISTORY above
+APP_VERSION = "1.9.0"             # keep in sync with VERSION HISTORY above
 AVG_SPEED_MPH = 40.0          # assumed average driving speed
-ACTIVATION_HOURS = 2.0        # time spent at the park activating
+ACTIVATION_HOURS = 2.0        # default time spent at the park activating
+MAX_ACTIVATION_HOURS = 12.0   # cap for user-supplied hours-per-park
 CACHE_MAX_AGE_DAYS = 7
 DEFAULT_RADIUS_MILES = 100.0
 MAX_MAP_WAYPOINTS = 10        # parks included in the Google Maps route
@@ -299,6 +308,20 @@ def resolve_constraint(data):
     unit = (data.get("unit") or "mi").strip().lower()
     if unit not in ("mi", "km"):
         return None, None, None, "Unknown unit (use 'mi' or 'km')."
+
+    # Optional: custom activation hours per park (default 2). Applies to
+    # the hours budget math; ignored for radius/distance modes.
+    activation = ACTIVATION_HOURS
+    if data.get("activation_hours") is not None:
+        a = parse_positive_float(data.get("activation_hours"),
+                                MAX_ACTIVATION_HOURS)
+        if a is None:
+            return None, None, None, (
+                f"Activation hours per park must be a positive number "
+                f"up to {MAX_ACTIVATION_HOURS:g}.")
+        activation = a
+    # Stash for the route handler (avoids widening every return tuple).
+    data["_activation_hours"] = activation
 
     if mode:
         if mode not in VALID_MODES:
@@ -586,18 +609,19 @@ def one_way_miles(city_coords, park):
     return geodesic(city_coords, coords).miles
 
 
-def trip_hours_for_park(one_way):
+def trip_hours_for_park(one_way, activation_hours=ACTIVATION_HOURS):
     """Round-trip driving hours plus the activation stop for a single park."""
-    return 2 * one_way / AVG_SPEED_MPH + ACTIVATION_HOURS
+    return 2 * one_way / AVG_SPEED_MPH + activation_hours
 
 
 def find_nearby_parks(parks_df, city_coords, max_distance_miles=None,
-                     max_hours=None, max_miles=None):
+                     max_hours=None, max_miles=None,
+                     activation_hours=ACTIVATION_HOURS):
     """Return active park records (dicts) satisfying ALL given constraints.
 
     Constraints are a funnel, not an either/or:
       - max_distance_miles: straight-line radius from the city
-      - max_hours: round-trip drive time + ACTIVATION_HOURS per park
+      - max_hours: round-trip drive time + activation_hours per park
       - max_miles: round-trip mileage per park
     Results are sorted nearest-first with a `distance_miles` key.
     """
@@ -614,7 +638,7 @@ def find_nearby_parks(parks_df, city_coords, max_distance_miles=None,
         radius = float("inf")
     if max_hours is not None:
         # hours budget -> max one-way miles
-        budget_miles = (max_hours - ACTIVATION_HOURS) * AVG_SPEED_MPH / 2
+        budget_miles = (max_hours - activation_hours) * AVG_SPEED_MPH / 2
         radius = min(radius, max(budget_miles, 0.0))
     if max_miles is not None:
         radius = min(radius, max_miles / 2)
@@ -637,7 +661,8 @@ def find_nearby_parks(parks_df, city_coords, max_distance_miles=None,
             continue
         if max_miles is not None and 2 * one_way > max_miles:
             continue
-        if max_hours is not None and trip_hours_for_park(one_way) > max_hours:
+        if max_hours is not None and trip_hours_for_park(
+                one_way, activation_hours) > max_hours:
             continue
         park["distance_miles"] = one_way
         results.append(park)
@@ -648,7 +673,8 @@ def find_nearby_parks(parks_df, city_coords, max_distance_miles=None,
     return results
 
 
-def generate_optimized_trip(parks, city_coords, max_hours=None, max_miles=None):
+def generate_optimized_trip(parks, city_coords, max_hours=None, max_miles=None,
+                           activation_hours=ACTIVATION_HOURS):
     """Greedy nearest-neighbour multi-park route that fits the budget.
 
     Budget accounting includes the drive from the last park back home.
@@ -676,7 +702,7 @@ def generate_optimized_trip(parks, city_coords, max_hours=None, max_miles=None):
             leg = geodesic(current, coords).miles
             home_leg = geodesic(coords, city_coords).miles
             if max_hours is not None:
-                projected = time_used + leg / AVG_SPEED_MPH + ACTIVATION_HOURS \
+                projected = time_used + leg / AVG_SPEED_MPH + activation_hours \
                     + home_leg / AVG_SPEED_MPH
                 if projected > max_hours:
                     continue
@@ -689,7 +715,7 @@ def generate_optimized_trip(parks, city_coords, max_hours=None, max_miles=None):
         if best is None:
             break
         coords = _park_coords(best)
-        time_used += best_leg / AVG_SPEED_MPH + ACTIVATION_HOURS
+        time_used += best_leg / AVG_SPEED_MPH + activation_hours
         route_miles += best_leg
         selected.append(best)
         current = coords
@@ -1213,7 +1239,7 @@ HTML_TEMPLATE = '''
                 <h3>Pro Tips</h3>
                 <ul>
                     <li>Try "Eustace" with Texas and 4 hours</li>
-                    <li>Hours budget = round-trip driving + 2h activation per park</li>
+                    <li>Hours budget = round-trip driving + activation time per park (default 2h, adjustable)</li>
                     <li>Check Google Maps for the numbered route</li>
                 </ul>
             </div>
@@ -1279,6 +1305,17 @@ HTML_TEMPLATE = '''
                     </div>
                     <small class="hint" id="modeHint"></small>
                 </div>
+
+                <div class="form-group" id="activationGroup" hidden>
+                    <label for="activation_hours">Hours per park:</label>
+                    <input type="number" id="activation_hours"
+                           name="activation_hours" value="2" min="0.5"
+                           max="12" step="0.5"
+                           aria-label="Activation hours per park">
+                    <small class="hint">Time you spend at each park
+                        activating (default 2h). Included in your time
+                        budget per park.</small>
+                </div>
                 
                 <button type="submit">Plan My Trip</button>
             </form>
@@ -1322,10 +1359,11 @@ HTML_TEMPLATE = '''
         };
         const MODE_HINTS = {
             radius: 'How far from your location to look for parks (as the crow flies).',
-            hours: 'Total time budget per park: round-trip driving at ~40 mph plus a 2-hour activation stop.',
+            hours: 'Total time budget per park: round-trip driving at ~40 mph plus your activation stop.',
             distance: 'Maximum round-trip driving distance per park.'
         };
         const unitToggle = document.querySelector('.unit-toggle');
+        const activationGroup = document.getElementById('activationGroup');
 
         function currentMode() {
             return document.querySelector('input[name="mode"]:checked').value;
@@ -1355,6 +1393,8 @@ HTML_TEMPLATE = '''
             unitToggle.title = isHours
                 ? 'Not applicable: driving time is measured in hours, not distance units.'
                 : '';
+            // "Hours per park" only matters for the time-budget mode.
+            activationGroup.hidden = !isHours;
             const valueInput = document.getElementById('value');
             valueInput.value = MODE_DEFAULTS[mode][unit];
             valueInput.min = mode === 'hours' ? '0.5' : '1';
@@ -1530,6 +1570,7 @@ def plan_trip():
         radius_value, hours_value, miles_value, err = resolve_constraint(data)
         if err:
             return jsonify({'error': err}), 400
+        activation_hours = data.get("_activation_hours", ACTIVATION_HOURS)
 
         if radius_value is None and hours_value is None and miles_value is None:
             return jsonify({'error': 'Please provide a trip constraint '\
@@ -1558,13 +1599,15 @@ def plan_trip():
             max_distance_miles=radius_value,
             max_hours=hours_value,
             max_miles=miles_value,
+            activation_hours=activation_hours,
         )
 
         # Build a multi-park route that fits the budget (if any budget given).
         if hours_value or miles_value:
             optimized = generate_optimized_trip(
                 nearby_parks, city_coords,
-                max_hours=hours_value, max_miles=miles_value)
+                max_hours=hours_value, max_miles=miles_value,
+                activation_hours=activation_hours)
             if optimized:
                 nearby_parks = optimized
 
