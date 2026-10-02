@@ -63,6 +63,14 @@
 #                    'activation_hours' input (0.5-12h, default 2) shown
 #                    in Driving-time mode; flows through trip_hours_for_park,
 #                    find_nearby_parks and generate_optimized_trip.
+# 2.0.0  2026-10-02  Road Trip tab: point-to-point trips. Enter origin +
+#                    destination; the driving route is fetched from OSRM
+#                    (free, no API key), active POTA parks within a
+#                    configurable corridor (default 25 mi) of the road
+#                    are found, ordered by trip progress, and returned
+#                    with a Google Maps point-to-point waypoint URL
+#                    (origin -> parks -> destination). New endpoint
+#                    POST /road_trip {origin, destination, corridor, unit}.
 # ---------------------------------------------------------------------------
 """
 POTA Trip Planner — Flask backend.
@@ -90,7 +98,7 @@ from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
 
 # ---------------------------------------------------------------- constants
-APP_VERSION = "1.9.0"             # keep in sync with VERSION HISTORY above
+APP_VERSION = "2.0.0"             # keep in sync with VERSION HISTORY above
 AVG_SPEED_MPH = 40.0          # assumed average driving speed
 ACTIVATION_HOURS = 2.0        # default time spent at the park activating
 MAX_ACTIVATION_HOURS = 12.0   # cap for user-supplied hours-per-park
@@ -107,6 +115,15 @@ MAX_LOCATION_LEN = 200        # chars; longer is abuse, not a place name
 GEOCODE_CACHE_MAX = 1000      # LRU cap: attacker-controlled keys, bound it
 RATE_LIMIT_MAX = 30           # /plan_trip requests per window per IP
 RATE_LIMIT_WINDOW_S = 60.0
+
+# Road-trip (point-to-point) settings — see VERSION HISTORY 2.0.0.
+OSRM_ROUTE_URL = os.environ.get(
+    "POTA_OSRM_URL",
+    "https://router.project-osrm.org/route/v1/driving")
+DEFAULT_CORRIDOR_MILES = 25.0   # how far off the road a park may sit
+MAX_CORRIDOR_MILES = 100.0
+MAX_ROAD_TRIP_MILES = 3000.0  # same sanity bound as trip distance
+ROAD_TRIP_MAX_PARKS = 10        # Google Maps waypoint cap
 
 # Default off shared /tmp (symlink risk on multi-user hosts); override with
 # POTA_CACHE_FILE / POTA_LOG_FILE (the systemd unit already does).
@@ -749,6 +766,169 @@ def generate_google_maps_url_with_markers(city, parks):
         return "https://www.google.com/maps"
 
 
+def generate_google_maps_url_point_to_point(origin_name, dest_name, parks):
+    """Google Maps directions URL: origin -> parks (numbered) -> destination.
+
+    Same numbered-stop rendering as the round-trip variant, but the trip
+    starts at one city and ends at another.
+    """
+    try:
+        waypoints = []
+        for park in parks[:ROAD_TRIP_MAX_PARKS]:
+            coords = _park_coords(park)
+            if coords:
+                waypoints.append(f"{coords[0]},{coords[1]}")
+        url = ("https://www.google.com/maps/dir/?api=1"
+               f"&origin={quote(str(origin_name))}"
+               f"&destination={quote(str(dest_name))}")
+        if waypoints:
+            url += "&waypoints=" + "|".join(waypoints)
+        return url
+    except Exception as e:
+        logger.exception("Error generating point-to-point Maps URL: %s", e)
+        return "https://www.google.com/maps"
+
+
+# ------------------------------------------------------------- road trips
+_route_cache = _LRUGeocodeCache(100)   # (origin,dest) -> route dict
+
+
+def fetch_driving_route(origin_coords, dest_coords):
+    """Fetch the driving route polyline between two points from OSRM.
+
+    Returns a dict:
+      {'coords': [(lat, lon), ...],   # ordered along the route
+       'distance_miles': float,
+       'duration_hours': float}
+    or None on failure. Cached per coordinate pair.
+
+    Note: OSRM's public demo server is used (no API key). The response
+    geometry is Google-independent; the user-facing route is still
+    rendered by Google Maps via the waypoint URL.
+    """
+    key = (round(origin_coords[0], 4), round(origin_coords[1], 4),
+           round(dest_coords[0], 4), round(dest_coords[1], 4))
+    cached = _route_cache.get(key)
+    if cached is not None:
+        return cached
+    try:
+        url = (f"{OSRM_ROUTE_URL}/"
+               f"{origin_coords[1]},{origin_coords[0]};"
+               f"{dest_coords[1]},{dest_coords[0]}"
+               f"?overview=full&geometries=geojson")
+        resp = requests.get(url, timeout=30,
+                           headers={"User-Agent": NOMINATIM_UA})
+        resp.raise_for_status()
+        payload = resp.json()
+        if payload.get("code") != "Ok" or not payload.get("routes"):
+            logger.warning("OSRM no route: %s", payload.get("code"))
+            return None
+        route = payload["routes"][0]
+        # GeoJSON coords are [lon, lat] — flip to (lat, lon).
+        coords = [(pt[1], pt[0]) for pt in route["geometry"]["coordinates"]]
+        result = {
+            "coords": coords,
+            "distance_miles": route["distance"] / 1609.344,
+            "duration_hours": route["duration"] / 3600.0,
+        }
+        _route_cache.set(key, result)
+        return result
+    except Exception as e:
+        logger.error("OSRM route fetch failed: %s", e)
+        return None
+
+
+def _point_along_progress(route_coords, point):
+    """Fraction (0..1) of the route nearest to `point`, plus distance in miles.
+
+    Projects the park onto the nearest route segment; returns
+    (progress_fraction, miles_off_route). Uses planar approximation on
+    the segment — fine at corridor scales.
+    """
+    if not route_coords:
+        return None, None
+    lat, lon = point
+    cos_lat = max(math.cos(math.radians(lat)), 1e-6)
+    # Convert to planar miles.
+    px, py = lon * 69.0 * cos_lat, lat * 69.0
+    seg_lengths = []
+    total = 0.0
+    for a, b in zip(route_coords, route_coords[1:]):
+        ax, ay = a[1] * 69.0 * cos_lat, a[0] * 69.0
+        bx, by = b[1] * 69.0 * cos_lat, b[0] * 69.0
+        seg_lengths.append(math.hypot(bx - ax, by - ay))
+        total += seg_lengths[-1]
+    if total <= 0:
+        return 0.0, 0.0
+    best_d2 = None
+    best_along = 0.0
+    acc = 0.0
+    for (a, b), seg_len in zip(zip(route_coords, route_coords[1:]),
+                              seg_lengths):
+        ax, ay = a[1] * 69.0 * cos_lat, a[0] * 69.0
+        bx, by = b[1] * 69.0 * cos_lat, b[0] * 69.0
+        if seg_len == 0:
+            continue
+        # Projection of p onto segment a-b, clamped to [0,1].
+        t = ((px - ax) * (bx - ax) + (py - ay) * (by - ay)) / (seg_len ** 2)
+        t = max(0.0, min(1.0, t))
+        cx, cy = ax + t * (bx - ax), ay + t * (by - ay)
+        d2 = (px - cx) ** 2 + (py - cy) ** 2
+        if best_d2 is None or d2 < best_d2:
+            best_d2 = d2
+            best_along = (acc + t * seg_len) / total
+        acc += seg_len
+    if best_d2 is None:
+        return 0.0, 0.0
+    return best_along, math.sqrt(best_d2)
+
+
+def parks_along_route(parks_df, route_coords, corridor_miles=DEFAULT_CORRIDOR_MILES):
+    """Active parks within `corridor_miles` of the route, ordered along it.
+
+    Each returned park dict gains:
+      - 'off_route_miles': perpendicular distance from the road
+      - 'progress': 0..1 fraction of the trip where the park sits
+    """
+    if parks_df is None or parks_df.empty or not route_coords:
+        return []
+    df = _filter_active(parks_df).dropna(subset=["latitude", "longitude"])
+
+    # Bounding-box prefilter: only parks within corridor of the route's
+    # lat/lon extent can possibly be within the corridor. Cuts the O(n*m)
+    # projection from ~90k parks down to the handful near the road.
+    lats = [c[0] for c in route_coords]
+    lons = [c[1] for c in route_coords]
+    lat_pad = corridor_miles / 69.0
+    lon_pad = corridor_miles / (69.0 * max(
+        math.cos(math.radians(sum(lats) / len(lats))), 1e-6))
+    df = df[df["latitude"].between(min(lats) - lat_pad, max(lats) + lat_pad)
+            & df["longitude"].between(min(lons) - lon_pad, max(lons) + lon_pad)]
+
+    # Simplify the route for projection: cap at ~200 points. Corridor
+    # decisions don't need full polyline resolution.
+    step = max(1, len(route_coords) // 200)
+    simple = route_coords[::step]
+    if simple[-1] != route_coords[-1]:
+        simple.append(route_coords[-1])
+
+    results = []
+    for park in df.to_dict("records"):
+        coords = _park_coords(park)
+        if coords is None:
+            continue
+        progress, off = _point_along_progress(simple, coords)
+        if progress is None or off > corridor_miles:
+            continue
+        park["off_route_miles"] = off
+        park["progress"] = progress
+        results.append(park)
+    results.sort(key=lambda p: p["progress"])
+    logger.info("parks_along_route: %d parks within %g mi of route",
+                len(results), corridor_miles)
+    return results
+
+
 # ---------------------------------------------------------------- frontend
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
@@ -1205,6 +1385,46 @@ HTML_TEMPLATE = '''
         .park-item .park-distance {
             margin-left: 15px;
         }
+
+        .tab-bar {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 20px;
+            border-bottom: 2px solid var(--border-color);
+        }
+
+        .tab-btn {
+            background: transparent;
+            color: var(--header-color);
+            border: none;
+            border-bottom: 3px solid transparent;
+            padding: 12px 24px;
+            font-size: 17px;
+            font-weight: 600;
+            cursor: pointer;
+            width: auto;
+            box-shadow: none;
+            transition: all 0.2s ease;
+        }
+
+        .tab-btn:hover {
+            transform: none;
+            background: rgba(52, 152, 219, 0.08);
+        }
+
+        .tab-btn.selected {
+            border-bottom-color: var(--accent-color-2);
+            color: var(--accent-color-2);
+        }
+
+        .tab-panel[hidden] {
+            display: none;
+        }
+
+        .road-summary {
+            margin: 10px 0;
+            font-weight: 600;
+        }
     </style>
 </head>
 <body>
@@ -1251,7 +1471,17 @@ HTML_TEMPLATE = '''
                 <div class="subtitle">Plan Your Ham Radio Adventures Worldwide!
                     <br><small>by N5SKT</small></div>
             </div>
-            
+
+            <div class="tab-bar" role="tablist" aria-label="Trip planner tabs">
+                <button type="button" class="tab-btn selected" id="tabHome"
+                        role="tab" aria-selected="true"
+                        onclick="switchTab('home')">Home Trip</button>
+                <button type="button" class="tab-btn" id="tabRoad"
+                        role="tab" aria-selected="false"
+                        onclick="switchTab('road')">Road Trip</button>
+            </div>
+
+            <div id="panelHome" class="tab-panel">
             <form id="tripForm">
                 <div class="form-group">
                     <label for="location">Location:</label>
@@ -1325,6 +1555,58 @@ HTML_TEMPLATE = '''
                 <div id="resultContent"></div>
                 <a id="mapsLink" class="google-maps-link" href="#" target="_blank">View on Google Maps</a>
             </div>
+            </div><!-- /panelHome -->
+
+            <div id="panelRoad" class="tab-panel" hidden>
+                <form id="roadForm">
+                    <div class="form-group">
+                        <label for="origin">Start from:</label>
+                        <input type="text" id="origin" name="origin" required
+                               placeholder="Origin city, e.g. Dallas, TX"
+                               autocomplete="off">
+                    </div>
+                    <div class="form-group">
+                        <label for="destination">Driving to:</label>
+                        <input type="text" id="destination" name="destination"
+                               required
+                               placeholder="Destination city, e.g. Denver, CO"
+                               autocomplete="off">
+                    </div>
+                    <div class="form-group">
+                        <label for="corridor">Corridor width (how far from
+                            the road to look for parks):</label>
+                        <div class="value-row">
+                            <input type="number" id="corridor" name="corridor"
+                                   value="25" min="1" step="5"
+                                   aria-label="Corridor width">
+                            <div class="unit-toggle" id="roadUnitToggle"
+                                 role="radiogroup" aria-label="Distance unit">
+                                <label class="unit-option">
+                                    <input type="radio" name="road_unit"
+                                           value="mi" checked> Miles
+                                </label>
+                                <label class="unit-option">
+                                    <input type="radio" name="road_unit"
+                                           value="km">
+                                    Kilometers
+                                </label>
+                            </div>
+                        </div>
+                        <small class="hint">Parks within this distance of the
+                            driving route are added as stops (max 10 stops —
+                            Google Maps waypoint limit).</small>
+                    </div>
+                    <button type="submit">Find Parks Along the Route</button>
+                </form>
+
+                <div id="roadResult" class="result">
+                    <h2 id="roadResultTitle">Road trip</h2>
+                    <div id="roadSummary" class="hint"></div>
+                    <div id="roadContent"></div>
+                    <a id="roadMapsLink" class="google-maps-link" href="#"
+                       target="_blank">View route on Google Maps</a>
+                </div>
+            </div><!-- /panelRoad -->
         </div>
     </div>
 
@@ -1501,6 +1783,121 @@ HTML_TEMPLATE = '''
                 submitButton.disabled = false;
             });
         });
+
+        // ---- v2.0.0: Road Trip tab (point-to-point, parks along route) ----
+        function switchTab(which) {
+            const isHome = which === 'home';
+            document.getElementById('panelHome').hidden = !isHome;
+            document.getElementById('panelRoad').hidden = isHome;
+            document.getElementById('tabHome').classList
+                .toggle('selected', isHome);
+            document.getElementById('tabRoad').classList
+                .toggle('selected', !isHome);
+            document.getElementById('tabHome')
+                .setAttribute('aria-selected', String(isHome));
+            document.getElementById('tabRoad')
+                .setAttribute('aria-selected', String(!isHome));
+        }
+
+        function roadUnit() {
+            return document.querySelector(
+                'input[name="road_unit"]:checked').value;
+        }
+        function fmtRoadDist(miles) {
+            if (roadUnit() === 'km') {
+                return (miles * 1.609344).toFixed(1) + ' km';
+            }
+            return miles.toFixed(1) + ' mi';
+        }
+
+        document.getElementById('roadForm').addEventListener('submit',
+            function(e) {
+            e.preventDefault();
+            const resultDiv = document.getElementById('roadResult');
+            const content = document.getElementById('roadContent');
+            content.innerHTML = '';
+            resultDiv.style.display = 'none';
+
+            const formData = new FormData(this);
+            const data = {};
+            for (let [key, value] of formData.entries()) {
+                if (value.trim() !== '') data[key] = value;
+            }
+            // Rename road_unit -> unit for the API.
+            if (data.road_unit) { data.unit = data.road_unit; }
+            delete data.road_unit;
+
+            const submitButton = this.querySelector('button');
+            const originalText = submitButton.textContent;
+            submitButton.textContent = 'Mapping route...';
+            submitButton.disabled = true;
+
+            fetch('/road_trip', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data)
+            })
+            .then(response => response.json()
+                .catch(() => ({}))
+                .then(body => ({ status: response.status, body: body })))
+            .then(({ status, body }) => {
+                const title = document.getElementById('roadResultTitle');
+                const summary = document.getElementById('roadSummary');
+                const mapsLink = document.getElementById('roadMapsLink');
+                if (body.error) {
+                    title.textContent = 'Road trip';
+                    summary.textContent = '';
+                    content.innerHTML =
+                        `<div class="error">${esc(body.error)}</div>`;
+                    resultDiv.style.display = 'block';
+                } else if (!body.parks || body.parks.length === 0) {
+                    title.textContent =
+                        `${esc(body.origin)} → ${esc(body.destination)}`;
+                    summary.textContent =
+                        `Route: ${fmtRoadDist(body.routeDistanceMiles)} · ` +
+                        `~${body.routeDurationHours.toFixed(1)} h driving. ` +
+                        `No parks found within ${fmtRoadDist(body.corridorMiles)} ` +
+                        `of the road. Try a wider corridor.`;
+                    mapsLink.href = body.googleMapsUrl;
+                    resultDiv.style.display = 'block';
+                } else {
+                    title.textContent =
+                        `${esc(body.origin)} → ${esc(body.destination)}`;
+                    summary.textContent =
+                        `Route: ${fmtRoadDist(body.routeDistanceMiles)} · ` +
+                        `~${body.routeDurationHours.toFixed(1)} h driving · ` +
+                        `${body.parkCount} park stop(s) within ` +
+                        `${fmtRoadDist(body.corridorMiles)} of the road`;
+                    let html = '<div class="park-list">';
+                    body.parks.forEach((park, index) => {
+                        html += `
+                            <div class="park-item">
+                                <div class="park-info">
+                                    <span class="park-number-marker">${index + 1}</span>
+                                    <span class="park-name">${esc(park.name)}</span>
+                                    <br>
+                                    <span class="park-reference">${esc(park.reference)}</span>
+                                </div>
+                                <div class="park-distance">${fmtRoadDist(park.off_route_miles)} off route</div>
+                            </div>
+                        `;
+                    });
+                    html += '</div>';
+                    content.innerHTML = html;
+                    mapsLink.href = body.googleMapsUrl;
+                    resultDiv.style.display = 'block';
+                }
+            })
+            .catch(error => {
+                content.innerHTML =
+                    `<div class="error">Network error: ${esc(error.message)}</div>`;
+                resultDiv.style.display = 'block';
+            })
+            .finally(() => {
+                submitButton.textContent = originalText;
+                submitButton.disabled = false;
+            });
+        });
     </script>
 </body>
 </html>
@@ -1630,6 +2027,95 @@ def plan_trip():
 
     except Exception as e:
         logger.exception("Application error: %s", e)
+        return jsonify({'error': f'Application error: {type(e).__name__}'}), 500
+
+
+@app.route('/road_trip', methods=['POST'])
+def road_trip():
+    """Point-to-point trip: find POTA parks along the driving route.
+
+    Input JSON:
+      origin       — start city/place (required)
+      destination  — end city/place (required)
+      corridor     — miles off-route a park may sit (default 25, max 100)
+      unit         — 'mi' or 'km' for corridor + display
+    """
+    try:
+        client_ip = (request.headers.get('X-Forwarded-For', '')
+                     .split(',')[0].strip() or request.remote_addr or 'unknown')
+        if not _plan_trip_limiter.allow(client_ip):
+            logger.warning("Rate limit exceeded for %s", client_ip)
+            return jsonify({'error': 'Too many requests. Please slow down.'}), 429
+
+        data = request.get_json(silent=True) or {}
+        for field in ('origin', 'destination'):
+            if len(str(data.get(field) or '')) > MAX_LOCATION_LEN:
+                return jsonify({'error': f'{field.capitalize()} too long '
+                                        f'(max {MAX_LOCATION_LEN} chars).'}), 400
+        origin = sanitize_location(data.get('origin'))
+        destination = sanitize_location(data.get('destination'))
+        if not origin or not destination:
+            return jsonify({'error': 'Please provide both an origin and a '
+                                    'destination (e.g. "Dallas, TX" and '
+                                    '"Denver, CO").'}), 400
+
+        unit = (data.get('unit') or 'mi').strip().lower()
+        if unit not in ("mi", "km"):
+            return jsonify({'error': "Unknown unit (use 'mi' or 'km')."}), 400
+        corridor = parse_positive_float(
+            to_miles_arg(data.get('corridor'), unit), MAX_CORRIDOR_MILES)
+        if corridor is None:
+            corridor = DEFAULT_CORRIDOR_MILES
+
+        parks_df = load_parks_from_cache()
+        if parks_df.empty:
+            return jsonify({'error': 'Could not load park data. '
+                                    'Please try again later.'}), 500
+
+        origin_coords = geocode_city(origin)
+        if not origin_coords:
+            return jsonify({'error': f'Could not find origin "{origin}". '
+                                    'Please check the place name.'}), 400
+        dest_coords = geocode_city(destination)
+        if not dest_coords:
+            return jsonify({'error': f'Could not find destination '
+                                    f'"{destination}". Please check the '
+                                    'place name.'}), 400
+
+        route = fetch_driving_route(origin_coords, dest_coords)
+        if route is None:
+            return jsonify({'error': 'Could not get a driving route between '
+                                    'those places. Please try again.'}), 502
+        if route['distance_miles'] > MAX_ROAD_TRIP_MILES:
+            return jsonify({'error': f'Trip too long (max '
+                                    f'{MAX_ROAD_TRIP_MILES:g} mi).'}), 400
+
+        parks = parks_along_route(parks_df, route['coords'],
+                                 corridor_miles=corridor)
+        parks_data = [{
+            'name': p.get('name', 'Unnamed Park'),
+            'reference': p.get('reference', 'Unknown'),
+            'off_route_miles': round(p['off_route_miles'], 1),
+            'progress': round(p['progress'], 3),
+        } for p in parks[:ROAD_TRIP_MAX_PARKS]]
+
+        response_data = {
+            'origin': origin,
+            'destination': destination,
+            'routeDistanceMiles': round(route['distance_miles'], 1),
+            'routeDurationHours': round(route['duration_hours'], 1),
+            'corridorMiles': corridor,
+            'parkCount': len(parks_data),
+            'parks': parks_data,
+            'googleMapsUrl': generate_google_maps_url_point_to_point(
+                origin, destination, parks),
+        }
+        logger.info("Road trip %s -> %s: %d parks along %.0f mi route",
+                    origin, destination, len(parks_data),
+                    route['distance_miles'])
+        return jsonify(response_data)
+    except Exception as e:
+        logger.exception("Road trip error: %s", e)
         return jsonify({'error': f'Application error: {type(e).__name__}'}), 500
 
 

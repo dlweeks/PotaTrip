@@ -569,6 +569,136 @@ class TestActivationHours:
         assert "Mid Park" not in names
 
 
+# ------------------------------------------------------- road trip (v2.0)
+class TestRoadTrip:
+    """Point-to-point: parks within a corridor of the driving route."""
+
+    # Straight route due east from (29.57,-96.56) to (29.57,-95.56).
+    ROUTE = [(29.57, -96.56 + i * 0.1) for i in range(11)]
+
+    def test_progress_projection(self):
+        # Park on the route at ~50% progress, 0 mi off.
+        prog, off = appmod._point_along_progress(
+            self.ROUTE, (29.57, -96.06))
+        assert abs(prog - 0.5) < 0.02
+        assert off < 0.1
+        # Park far north of the route: large off-route distance.
+        prog, off = appmod._point_along_progress(
+            self.ROUTE, (30.57, -96.06))
+        assert off > 60
+        # Park before the start clamps to 0; past the end clamps to 1.
+        prog, _ = appmod._point_along_progress(self.ROUTE, (29.57, -97.5))
+        assert prog == 0.0
+        prog, _ = appmod._point_along_progress(self.ROUTE, (29.57, -94.5))
+        assert prog == 1.0
+
+    def test_parks_along_route_filters_and_orders(self, synthetic_df):
+        # Close Park (29.60,-96.60): near route start, ~2 mi off -> in.
+        # Mid Park (29.80,-96.40): ~16 mi off -> in with 25 mi corridor.
+        # Far Park (30.50,-97.00): ~65 mi off -> out.
+        parks = appmod.parks_along_route(
+            synthetic_df, self.ROUTE, corridor_miles=25.0)
+        names = [p["name"] for p in parks]
+        assert "Close Park" in names
+        assert "Mid Park" in names
+        assert "Far Park" not in names
+        assert "Dead Park" not in names          # inactive
+        assert "No Coords Park" not in names    # NaN coords
+        # Ordered by progress: Close Park (near start) before Mid Park.
+        assert names.index("Close Park") < names.index("Mid Park")
+
+    def test_narrow_corridor_excludes_far_parks(self, synthetic_df):
+        parks = appmod.parks_along_route(synthetic_df, self.ROUTE,
+                                        corridor_miles=1.0)
+        names = [p["name"] for p in parks]
+        assert "Mid Park" not in names
+
+    def test_endpoint_requires_origin_and_destination(self, client):
+        r = client.post("/road_trip", json={"origin": "Dallas, TX"})
+        assert r.status_code == 400
+        r = client.post("/road_trip", json={})
+        assert r.status_code == 400
+
+    def test_endpoint_road_trip_end_to_end(self, client, monkeypatch,
+                                         synthetic_df):
+        monkeypatch.setattr(appmod, "load_parks_from_cache",
+                           lambda: synthetic_df)
+        monkeypatch.setattr(appmod, "geocode_city",
+                           lambda loc, *a, **k: (29.57, -96.56)
+                           if "start" in loc.lower() else (29.57, -95.56))
+        monkeypatch.setattr(appmod, "fetch_driving_route",
+                           lambda a, b: {"coords": self.ROUTE,
+                                        "distance_miles": 69.0,
+                                        "duration_hours": 1.2})
+        r = client.post("/road_trip", json={
+            "origin": "start town, TX", "destination": "end town, TX"})
+        assert r.status_code == 200
+        body = r.get_json()
+        assert body["parkCount"] >= 2
+        assert body["routeDistanceMiles"] == 69.0
+        assert "origin=start" in body["googleMapsUrl"]
+        assert "destination=end" in body["googleMapsUrl"]
+        assert "waypoints=" in body["googleMapsUrl"]
+        # Parks ordered by progress; each has off_route_miles.
+        assert body["parks"][0]["name"] == "Close Park"
+        assert "off_route_miles" in body["parks"][0]
+
+    def test_endpoint_bad_origin_400(self, client, monkeypatch):
+        monkeypatch.setattr(appmod, "load_parks_from_cache",
+                           lambda: __import__("pandas").DataFrame(
+                               {"reference": ["x"], "active": [1],
+                                "latitude": [1.0], "longitude": [1.0]}))
+        monkeypatch.setattr(appmod, "geocode_city",
+                           lambda loc, *a, **k: None)
+        r = client.post("/road_trip", json={
+            "origin": "Nowhereville", "destination": "Alsohere"})
+        assert r.status_code == 400
+        assert "origin" in r.get_json()["error"]
+
+    def test_endpoint_route_failure_502(self, client, monkeypatch,
+                                      synthetic_df):
+        monkeypatch.setattr(appmod, "load_parks_from_cache",
+                           lambda: synthetic_df)
+        monkeypatch.setattr(appmod, "geocode_city",
+                           lambda loc, *a, **k: (29.5, -96.5))
+        monkeypatch.setattr(appmod, "fetch_driving_route",
+                           lambda a, b: None)
+        r = client.post("/road_trip", json={
+            "origin": "A, TX", "destination": "B, TX"})
+        assert r.status_code == 502
+
+    def test_fetch_driving_route_parses_osrm(self, monkeypatch):
+        class FakeResp:
+            status_code = 200
+            def raise_for_status(self): pass
+            def json(self):
+                return {"code": "Ok", "routes": [{
+                    "distance": 160934.4,   # 100 miles
+                    "duration": 7200.0,     # 2 hours
+                    "geometry": {"coordinates": [
+                        [-96.56, 29.57], [-95.56, 29.57]]}}]}
+        calls = {}
+        def fake_get(url, **kw):
+            calls["url"] = url
+            return FakeResp()
+        monkeypatch.setattr(appmod.requests, "get", fake_get)
+        monkeypatch.setattr(appmod, "_route_cache",
+                           appmod._LRUGeocodeCache(10))
+        route = appmod.fetch_driving_route((29.57, -96.56),
+                                         (29.57, -95.56))
+        assert route is not None
+        assert abs(route["distance_miles"] - 100.0) < 0.01
+        assert abs(route["duration_hours"] - 2.0) < 0.01
+        assert route["coords"][0] == (29.57, -96.56)   # lat,lon flipped
+        assert "router.project-osrm.org" in calls["url"]
+
+    def test_road_trip_page_has_tabs(self, client):
+        html = client.get("/").get_data(as_text=True)
+        assert 'id="tabRoad"' in html
+        assert 'id="panelRoad"' in html
+        assert "Find Parks Along the Route" in html
+
+
 # ------------------------------------------------- v1.8.0 modes and units
 class TestConstraintModes:
     def test_radius_mode_miles(self):
