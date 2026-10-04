@@ -2,31 +2,33 @@
 #
 #   make            build the .deb (same as `make deb`)
 #   make deb        build the .deb into ./dist/
-#   make install    build + sudo dpkg -i (creates venv, systemd unit, enables+starts)
+#   make install    build + sudo dpkg -i (builds venv on target, enables+starts service)
 #   make uninstall  sudo dpkg -r potatrip
 #   make clean      remove build artifacts
 #
+# The package is Architecture: all — it ships NO pre-built binaries. The
+# python3 venv is created ON THE TARGET at install time (postinst runs
+# `python3 -m venv` + `pip install`), so the same .deb works on amd64
+# and arm64 (Raspberry Pi OS Bookworm) alike.
+#
 # The package installs:
-#   /opt/potatrip/            app.py + self-contained python3 venv (flask, pandas, geopy, requests)
+#   /opt/PotaTrip/            app.py, index.html, requirements.txt, LICENSE
+#   /opt/PotaTrip/.venv/      python3 venv built on the target at install time
 #   /usr/local/bin/potatrip   launcher (runs app.py with the venv python)
 #   /lib/systemd/system/potatrip.service   systemd unit (enabled + started in postinst)
 #   /var/lib/potatrip/        writable state (park cache, log), owned by user 'potatrip'
 
 PACKAGE    := potatrip
 VERSION    ?= 2.0.0
-ARCH       := $(shell dpkg --print-architecture)
+ARCH       := all
 DEB        := dist/$(PACKAGE)_$(VERSION)_$(ARCH).deb
 
-APP_SRC    := app.py index.html README.md requirements.txt
-PKG_ROOT   := opt/potatrip
-VENV_DIR   := $(PKG_ROOT)/venv
+APP_SRC    := app.py index.html README.md requirements.txt LICENSE
+PKG_ROOT   := opt/PotaTrip
 STAGE      := build/stage
 DESTDIR    := $(STAGE)
 
-PYTHON     ?= python3
-PIP        := $(DESTDIR)/$(VENV_DIR)/bin/pip
-
-.PHONY: all deb install uninstall clean venv stage
+.PHONY: all deb install uninstall clean stage
 
 all: deb
 
@@ -39,7 +41,7 @@ $(DEB): $(APP_SRC) packaging/control.template packaging/preinst packaging/postin
 	fakeroot sh -c 'chown -R root:root "$(STAGE)" && dpkg-deb --root-owner-group --build "$(STAGE)" "$(DEB)"'
 	@echo "Built: $(DEB)"
 
-# Assemble the staging tree with the venv already populated (offline install).
+# Assemble the staging tree. No venv here — postinst builds it on the target.
 stage:
 	rm -rf $(STAGE)
 	mkdir -p $(DESTDIR)/$(PKG_ROOT) $(DESTDIR)/usr/local/bin $(DESTDIR)/lib/systemd/system $(DESTDIR)/var/lib/potatrip
@@ -47,12 +49,6 @@ stage:
 	cp packaging/potatrip-launcher $(DESTDIR)/usr/local/bin/potatrip
 	chmod 755 $(DESTDIR)/usr/local/bin/potatrip
 	cp packaging/potatrip.service $(DESTDIR)/lib/systemd/system/potatrip.service
-	# Dedicated python3 environment, built at its final path inside the stage.
-	$(PYTHON) -m venv $(DESTDIR)/$(VENV_DIR)
-	$(PIP) install --no-cache-dir -r requirements.txt
-	# Repoint any staging-path shebangs/config at the real install location.
-	find $(DESTDIR)/$(VENV_DIR)/bin -maxdepth 1 -type f | xargs -r sed -i \
-		's|$(CURDIR)/$(STAGE)/$(PKG_ROOT)|/$(PKG_ROOT)|g'
 	# Control file
 	mkdir -p $(STAGE)/DEBIAN
 	sed -e 's/@VERSION@/$(VERSION)/g' -e 's/@ARCH@/$(ARCH)/g' \

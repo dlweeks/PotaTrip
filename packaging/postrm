@@ -8,7 +8,7 @@ case "$1" in
         ;;
     purge)
         systemctl disable --now potatrip.service >/dev/null 2>&1 || true
-        rm -rf /var/lib/potatrip
+        rm -rf /var/lib/potatrip /opt/PotaTrip/.venv
         if getent passwd potatrip >/dev/null; then userdel potatrip || true; fi
         if getent group potatrip >/dev/null; then groupdel potatrip || true; fi
         ;;

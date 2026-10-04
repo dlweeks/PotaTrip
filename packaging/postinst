@@ -1,8 +1,9 @@
 #!/bin/sh
-# postinst — create the service user/state dir, then enable + start the unit.
+# postinst — create service user/state dir, build the venv ON THIS MACHINE,
+# install app dependencies, then enable + start the unit.
 set -e
 
-# Dedicated system user/group (no login shell, no home outside state dir).
+# Dedicated system user/group (no login shell).
 if ! getent group potatrip >/dev/null; then
     groupadd --system potatrip
 fi
@@ -14,7 +15,19 @@ fi
 # Writable state (park CSV cache, log file).
 install -d -o potatrip -g potatrip /var/lib/potatrip
 
-# Make sure the launcher is executable (dpkg preserves our mode, belt-and-braces).
+# Build the virtual environment with the target's own python3, then install
+# the app's dependencies into it. Runs at install time so no pre-built,
+# wrong-architecture wheels are ever shipped.
+VENV=/opt/PotaTrip/.venv
+if [ ! -x "$VENV/bin/python" ]; then
+    echo "Building python venv at $VENV (this downloads flask, pandas, geopy, requests)..."
+    python3 -m venv "$VENV"
+fi
+"$VENV/bin/pip" install --no-cache-dir -r /opt/PotaTrip/requirements.txt
+chown -R root:potatrip "$VENV"
+chmod -R g-w "$VENV"
+
+# Launcher must be executable.
 chmod 755 /usr/local/bin/potatrip
 
 # Enable and start the systemd service.
