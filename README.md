@@ -75,6 +75,11 @@ GL.iNet router, see **[44NET-HOSTING.md](44NET-HOSTING.md)**.
 **Live demo:** the tested instance is hosted via 44Net at
 **http://44.27.136.37:5001** (GL.iNet Beryl AX tunnel → Raspberry Pi).
 
+**Cell phones:** the app is designed for **landscape mode** on phones.
+The form layout targets desktop widths; in portrait the page is wider
+than a phone screen and requires sideways scrolling. Rotate the phone to
+landscape for a proper fit. (Desktop/laptop windows are unaffected.)
+
 For changing ports/bind address, firewall port guidance, and reverse-proxy
 setup, see **[docs/systemd-deployment.md](docs/systemd-deployment.md)**.
 
