@@ -52,12 +52,22 @@ A web application for planning ham radio park visiting trips using the POTA (Par
 | `POTA_LOG_FILE` | `/tmp/pota_trip_log.txt` | Log file |
 | `POTA_GEOCODE_UA` | `PotaTripPlanner/2.0 (...)` | Nominatim user agent (set your callsign/email if publishing) |
 
-### Debian package (system-wide install)
+### Debian package (system-wide install, incl. Raspberry Pi)
 
-`make deb` builds a `.deb` into `dist/`; `make install` builds and installs it.
-The package puts the app in `/opt/potatrip` with a self-contained python3
-venv, installs the launcher `/usr/local/bin/potatrip`, and installs, enables
-and starts the systemd service `potatrip` (binds `0.0.0.0:5001` by default).
+`make deb` builds an `Architecture: all` `.deb` into `dist/`; `make install`
+builds and installs it. The package ships no pre-built binaries — the Python
+venv is created **on the target machine at install time** with the system
+`python3`, so the same `.deb` works on Raspberry Pi OS (arm64/32-bit) and
+x86_64 Debian/Ubuntu.
+
+The package puts the app in `/opt/PotaTrip` with the venv at
+`/opt/PotaTrip/.venv`, installs the launcher `/usr/local/bin/potatrip`,
+and installs, enables and starts the systemd service `potatrip` (binds
+`0.0.0.0:5001` by default).
+
+**Raspberry Pi users:** see **[PI-INSTALL.md](PI-INSTALL.md)** for the
+full step-by-step (prerequisites, install, verification, VPN routing via a
+GL.iNet / 44.net WireGuard setup).
 
 For changing ports/bind address, firewall port guidance, and reverse-proxy
 setup, see **[docs/systemd-deployment.md](docs/systemd-deployment.md)**.
