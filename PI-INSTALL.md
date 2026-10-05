@@ -1,6 +1,6 @@
 # Installing POTATrip on a Raspberry Pi
 
-The `potatrip_2.0.1_all.deb` release package works on **any architecture** —
+The `potatrip_2.0.2_all.deb` release package works on **any architecture** —
 it ships no pre-built binaries. The Python virtual environment is created
 **on your Pi at install time** using the system `python3`, so the same
 `.deb` runs on Raspberry Pi OS (arm64 or 32-bit), x86_64 Debian/Ubuntu, etc.
@@ -20,8 +20,8 @@ Download the `.deb` from the
 [GitHub releases page](https://github.com/dlweeks/PotaTrip/releases) and install:
 
 ```bash
-wget https://github.com/dlweeks/PotaTrip/releases/download/v2.0.1/potatrip_2.0.1_all.deb
-sudo dpkg -i potatrip_2.0.1_all.deb
+wget https://github.com/dlweeks/PotaTrip/releases/download/v2.0.2/potatrip_2.0.2_all.deb
+sudo dpkg -i potatrip_2.0.2_all.deb
 ```
 
 What happens during install:
@@ -42,7 +42,7 @@ minutes on a Pi 3, under a minute on a Pi 4/5 with good network.
 ```bash
 systemctl status potatrip
 curl -s http://127.0.0.1:5001/health
-# {"cache_valid":true,"status":"ok","version":"2.0.1"}
+# {"cache_valid":true,"status":"ok","version":"2.0.2"}
 ```
 
 Open `http://<your-pi-ip>:5001` from any device on your LAN.

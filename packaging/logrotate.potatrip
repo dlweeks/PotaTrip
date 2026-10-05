@@ -1,0 +1,10 @@
+/var/lib/potatrip/pota_trip_log.txt {
+    daily
+    rotate 7
+    maxsize 10M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

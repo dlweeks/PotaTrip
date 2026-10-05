@@ -19,7 +19,7 @@
 #   /var/lib/potatrip/        writable state (park cache, log), owned by user 'potatrip'
 
 PACKAGE    := potatrip
-VERSION    ?= 2.0.1
+VERSION    ?= 2.0.2
 ARCH       := all
 DEB        := dist/$(PACKAGE)_$(VERSION)_$(ARCH).deb
 
@@ -49,6 +49,8 @@ stage:
 	cp packaging/potatrip-launcher $(DESTDIR)/usr/local/bin/potatrip
 	chmod 755 $(DESTDIR)/usr/local/bin/potatrip
 	cp packaging/potatrip.service $(DESTDIR)/lib/systemd/system/potatrip.service
+	mkdir -p $(DESTDIR)/etc/logrotate.d
+	cp packaging/logrotate.potatrip $(DESTDIR)/etc/logrotate.d/potatrip
 	# Control file
 	mkdir -p $(STAGE)/DEBIAN
 	sed -e 's/@VERSION@/$(VERSION)/g' -e 's/@ARCH@/$(ARCH)/g' \

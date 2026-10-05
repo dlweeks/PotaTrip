@@ -79,6 +79,10 @@
 #                    guide) and 44NET-HOSTING.md (publishing on a 44Net
 #                    address via a GL.iNet WireGuard tunnel; tested on
 #                    the GL.iNet Beryl AX GL-MT3600BE).
+# 2.0.2  2026-10-05  Log rotation: the package now installs an
+#                    /etc/logrotate.d/potatrip config (daily / 10 MB,
+#                    7 kept, gzip, copytruncate) and Depends on logrotate.
+#                    Previously the app's own log grew unbounded.
 # ---------------------------------------------------------------------------
 """
 POTA Trip Planner — Flask backend.
@@ -106,7 +110,7 @@ from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
 
 # ---------------------------------------------------------------- constants
-APP_VERSION = "2.0.1"             # keep in sync with VERSION HISTORY above
+APP_VERSION = "2.0.2"             # keep in sync with VERSION HISTORY above
 AVG_SPEED_MPH = 40.0          # assumed average driving speed
 ACTIVATION_HOURS = 2.0        # default time spent at the park activating
 MAX_ACTIVATION_HOURS = 12.0   # cap for user-supplied hours-per-park

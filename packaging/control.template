@@ -3,7 +3,7 @@ Version: @VERSION@
 Architecture: all
 Maintainer: N5SKT <dweeks@localhost>
 Installed-Size: 2000
-Depends: python3, python3-venv, python3-pip, systemd
+Depends: python3, python3-venv, python3-pip, systemd, logrotate
 Section: hamradio
 Priority: optional
 Homepage: https://github.com/dlweeks/PotaTrip
