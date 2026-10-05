@@ -34,7 +34,7 @@ published address.
 |---|---|
 | Valid amateur radio licence | 44Net is reserved for licensed hams; you register with your callsign |
 | 44Net Connect account | Free, self-service at <https://connect.44net.cloud> |
-| GL.iNet router (or any OpenWrt 21+ box) | Tested on GL-MT3600BE; any model with WireGuard Client support works |
+| GL.iNet router (or any OpenWrt 21+ box) | Tested on the **GL.iNet Beryl AX (GL-MT3600BE)** — [available on Amazon](https://link.amazon/B0ijjgGGp); any model with WireGuard Client support works |
 | Raspberry Pi (3/4/5) | Running Raspberry Pi OS Bookworm, wired (Ethernet) to the router |
 | POTATrip `.deb` | From the [releases page](https://github.com/dlweeks/PotaTrip/releases) — see [PI-INSTALL.md](PI-INSTALL.md) |
 
