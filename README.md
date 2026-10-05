@@ -66,8 +66,11 @@ and installs, enables and starts the systemd service `potatrip` (binds
 `0.0.0.0:5001` by default).
 
 **Raspberry Pi users:** see **[PI-INSTALL.md](PI-INSTALL.md)** for the
-full step-by-step (prerequisites, install, verification, VPN routing via a
-GL.iNet / 44.net WireGuard setup).
+full step-by-step (prerequisites, install, verification).
+
+**Publishing on 44Net:** to host the app on a public amateur-radio
+`44.x.y.z` address via a 44Net Connect WireGuard tunnel terminated on a
+GL.iNet router, see **[44NET-HOSTING.md](44NET-HOSTING.md)**.
 
 For changing ports/bind address, firewall port guidance, and reverse-proxy
 setup, see **[docs/systemd-deployment.md](docs/systemd-deployment.md)**.

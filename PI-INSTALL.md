@@ -116,6 +116,10 @@ Notes for this topology:
   VPN status page) — in this topology outages are almost always the VPN,
   not the app.
 
+For publishing the app itself on a public 44Net address through this
+topology (UCI port-forward, testing, troubleshooting), see
+**[44NET-HOSTING.md](44NET-HOSTING.md)**.
+
 ## Building the package yourself
 
 ```bash
