@@ -71,6 +71,14 @@
 #                    with a Google Maps point-to-point waypoint URL
 #                    (origin -> parks -> destination). New endpoint
 #                    POST /road_trip {origin, destination, corridor, unit}.
+# 2.0.1  2026-10-04  Architecture-independent .deb: the venv is built on
+#                    the install target (postinst) instead of shipped, so
+#                    one package serves amd64 and arm64 (Raspberry Pi).
+#                    App installs to /opt/PotaTrip with .venv; postrm
+#                    purge removes it. Added PI-INSTALL.md (Raspberry Pi
+#                    guide) and 44NET-HOSTING.md (publishing on a 44Net
+#                    address via a GL.iNet WireGuard tunnel; tested on
+#                    the GL.iNet Beryl AX GL-MT3600BE).
 # ---------------------------------------------------------------------------
 """
 POTA Trip Planner — Flask backend.
@@ -98,7 +106,7 @@ from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
 
 # ---------------------------------------------------------------- constants
-APP_VERSION = "2.0.0"             # keep in sync with VERSION HISTORY above
+APP_VERSION = "2.0.1"             # keep in sync with VERSION HISTORY above
 AVG_SPEED_MPH = 40.0          # assumed average driving speed
 ACTIVATION_HOURS = 2.0        # default time spent at the park activating
 MAX_ACTIVATION_HOURS = 12.0   # cap for user-supplied hours-per-park

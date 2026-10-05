@@ -104,7 +104,7 @@ wget https://github.com/dlweeks/PotaTrip/releases/download/v2.0.0/potatrip_2.0.0
 sudo dpkg -i potatrip_2.0.0_all.deb
 systemctl status potatrip
 curl -s http://127.0.0.1:5001/health
-# {"cache_valid":true,"status":"ok","version":"2.0.0"}
+# {"cache_valid":true,"status":"ok","version":"2.0.1"}
 ```
 
 The package builds the Python venv on the Pi at install time — the same
@@ -184,7 +184,7 @@ friend):
 ```bash
 curl.exe --max-time 8 http://44.x.y.z:5001/health     # Windows
 curl  --max-time 8 http://44.x.y.z:5001/health        # Linux/macOS
-# {"cache_valid":true,"status":"ok","version":"2.0.0"}
+# {"cache_valid":true,"status":"ok","version":"2.0.1"}
 ```
 
 Then open `http://44.x.y.z:5001` in a browser and plan a trip.

@@ -19,7 +19,7 @@
 #   /var/lib/potatrip/        writable state (park cache, log), owned by user 'potatrip'
 
 PACKAGE    := potatrip
-VERSION    ?= 2.0.0
+VERSION    ?= 2.0.1
 ARCH       := all
 DEB        := dist/$(PACKAGE)_$(VERSION)_$(ARCH).deb
 
