@@ -83,6 +83,11 @@
 #                    /etc/logrotate.d/potatrip config (daily / 10 MB,
 #                    7 kept, gzip, copytruncate) and Depends on logrotate.
 #                    Previously the app's own log grew unbounded.
+# 2.0.3  2026-11-10  Phone portrait-mode hint: a banner now asks
+#                    phone users to rotate to landscape (CSS media
+#                    query, max-width 700px + portrait; desktop
+#                    unaffected). Landscape-only use was documented
+#                    in the README; this makes it visible in the UI.
 # ---------------------------------------------------------------------------
 """
 POTA Trip Planner — Flask backend.
@@ -110,7 +115,7 @@ from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
 
 # ---------------------------------------------------------------- constants
-APP_VERSION = "2.0.2"             # keep in sync with VERSION HISTORY above
+APP_VERSION = "2.0.3"             # keep in sync with VERSION HISTORY above
 AVG_SPEED_MPH = 40.0          # assumed average driving speed
 ACTIVATION_HOURS = 2.0        # default time spent at the park activating
 MAX_ACTIVATION_HOURS = 12.0   # cap for user-supplied hours-per-park
@@ -1464,9 +1469,28 @@ HTML_TEMPLATE = '''
             cursor: not-allowed;
             transform: none;
         }
+        /* Phone portrait: nudge to landscape (desktop unaffected) */
+        .landscape-hint {
+            display: none;
+        }
+        @media screen and (max-width: 700px) and (orientation: portrait) {
+            .landscape-hint {
+                display: block;
+                background: var(--warning-color);
+                color: #333;
+                border: 2px solid #cc9900;
+                border-radius: 10px;
+                padding: 12px 16px;
+                margin: 0 0 16px 0;
+                font-size: 15px;
+                font-weight: 600;
+                text-align: center;
+            }
+        }
     </style>
 </head>
 <body>
+    <div class="landscape-hint">🔄 Rotate your phone to <b>landscape</b> for the best experience — this app is designed for landscape mode on phones.</div>
     <button class="dark-mode-toggle" onclick="toggleDarkMode()">Toggle Dark Mode</button>
     
     <div class="container">
