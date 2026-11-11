@@ -88,6 +88,13 @@
 #                    query, max-width 700px + portrait; desktop
 #                    unaffected). Landscape-only use was documented
 #                    in the README; this makes it visible in the UI.
+# 2.0.4  2026-11-10  Phone-friendly responsive layout: below 768px
+#                    the page becomes single-column (form first,
+#                    instructions sidebar stacked last), mode cards
+#                    stack vertically, value rows and park items
+#                    wrap, dark-mode toggle goes static, background
+#                    scrolls (iOS perf). Replaces the v2.0.3
+#                    rotate-to-landscape hint banner.
 # ---------------------------------------------------------------------------
 """
 POTA Trip Planner — Flask backend.
@@ -115,7 +122,7 @@ from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
 
 # ---------------------------------------------------------------- constants
-APP_VERSION = "2.0.3"             # keep in sync with VERSION HISTORY above
+APP_VERSION = "2.0.4"             # keep in sync with VERSION HISTORY above
 AVG_SPEED_MPH = 40.0          # assumed average driving speed
 ACTIVATION_HOURS = 2.0        # default time spent at the park activating
 MAX_ACTIVATION_HOURS = 12.0   # cap for user-supplied hours-per-park
@@ -1469,28 +1476,76 @@ HTML_TEMPLATE = '''
             cursor: not-allowed;
             transform: none;
         }
-        /* Phone portrait: nudge to landscape (desktop unaffected) */
-        .landscape-hint {
-            display: none;
-        }
-        @media screen and (max-width: 700px) and (orientation: portrait) {
-            .landscape-hint {
-                display: block;
-                background: var(--warning-color);
-                color: #333;
-                border: 2px solid #cc9900;
-                border-radius: 10px;
-                padding: 12px 16px;
-                margin: 0 0 16px 0;
+        /* Phone / narrow screens: single-column layout (v2.0.4) */
+        @media screen and (max-width: 768px) {
+            body {
+                padding: 10px;
+                background-attachment: scroll;
+            }
+            .container {
+                flex-direction: column;
+            }
+            .main-content {
+                order: 1;
+                padding: 15px;
+            }
+            .sidebar {
+                order: 2;
+                width: 100%;
+                box-sizing: border-box;
+                padding: 15px;
+            }
+            .title-container {
+                padding: 12px;
+                margin-bottom: 15px;
+            }
+            h1 {
+                font-size: 1.6em;
+            }
+            .subtitle {
+                font-size: 1em;
+            }
+            .tab-btn {
+                flex: 1;
+                padding: 10px 8px;
                 font-size: 15px;
-                font-weight: 600;
-                text-align: center;
+            }
+            .mode-selector {
+                flex-direction: column;
+            }
+            .value-row {
+                flex-wrap: wrap;
+            }
+            .value-row input[type="number"] {
+                flex: 1 1 120px;
+                width: auto;
+            }
+            .unit-toggle {
+                flex: 1 1 auto;
+                justify-content: center;
+            }
+            .park-item {
+                flex-wrap: wrap;
+                gap: 8px;
+            }
+            .park-item .park-distance {
+                margin-left: 0;
+            }
+            .dark-mode-toggle {
+                position: static;
+                width: auto;
+                display: block;
+                margin: 0 auto 10px auto;
+                padding: 8px 14px;
+                font-size: 14px;
+            }
+            .result {
+                padding: 15px;
             }
         }
     </style>
 </head>
 <body>
-    <div class="landscape-hint">🔄 Rotate your phone to <b>landscape</b> for the best experience — this app is designed for landscape mode on phones.</div>
     <button class="dark-mode-toggle" onclick="toggleDarkMode()">Toggle Dark Mode</button>
     
     <div class="container">
