@@ -95,6 +95,13 @@
 #                    wrap, dark-mode toggle goes static, background
 #                    scrolls (iOS perf). Replaces the v2.0.3
 #                    rotate-to-landscape hint banner.
+# 2.0.5  2026-11-11  Dedicated phone page at /m (alias /phone):
+#                    phone-first single-column UI with Home Trip and
+#                    Road Trip tabs, built on the existing /plan_trip
+#                    and /road_trip APIs. No background image or
+#                    animations, 44px+ touch targets, dark mode
+#                    shared with the main page. Desktop '/' unchanged
+#                    except a "phone version" link in the header.
 # ---------------------------------------------------------------------------
 """
 POTA Trip Planner — Flask backend.
@@ -122,7 +129,7 @@ from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
 
 # ---------------------------------------------------------------- constants
-APP_VERSION = "2.0.4"             # keep in sync with VERSION HISTORY above
+APP_VERSION = "2.0.5"             # keep in sync with VERSION HISTORY above
 AVG_SPEED_MPH = 40.0          # assumed average driving speed
 ACTIVATION_HOURS = 2.0        # default time spent at the park activating
 MAX_ACTIVATION_HOURS = 12.0   # cap for user-supplied hours-per-park
@@ -1587,7 +1594,8 @@ HTML_TEMPLATE = '''
             <div class="title-container">
                 <h1>🚀 POTA Trip Planner</h1>
                 <div class="subtitle">Plan Your Ham Radio Adventures Worldwide!
-                    <br><small>by N5SKT</small></div>
+                    <br><small>by N5SKT &middot;
+                    <a href="/m" style="color:rgba(255,255,255,0.95)">phone version</a></small></div>
             </div>
 
             <div class="tab-bar" role="tablist" aria-label="Trip planner tabs">
@@ -2096,6 +2104,358 @@ HTML_TEMPLATE = '''
 </body>
 </html>
 '''
+
+# ---------------------------------------------------------------------------
+# v2.0.5: dedicated phone page (/m). Phone-first single-column template,
+# no background image / animations, 44px+ touch targets, 16px inputs
+# (no iOS zoom). Reuses the existing /plan_trip and /road_trip JSON APIs
+# unchanged. Desktop '/' page is untouched except a link here.
+# CSP-safe: everything inline, no external resources.
+# ---------------------------------------------------------------------------
+PHONE_TEMPLATE = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>POTA Trip - Phone</title>
+<style>
+:root {
+  --bg:#f2f4f7; --card:#ffffff; --text:#222222; --head:#2c5aa0;
+  --btn:#2c5aa0; --line:#d5dbe4; --chip:#e9ecef; --ok:#28a745;
+  --warn:#fff3cd; --warn-text:#721c24;
+}
+body.dark-mode {
+  --bg:#17191c; --card:#24272c; --text:#e8eaed; --head:#8db1ff;
+  --btn:#4a7bff; --line:#3a3f46; --chip:#2f343b; --ok:#5ec46a;
+  --warn:#4a3d14; --warn-text:#ffb3b3;
+}
+* { box-sizing: border-box; }
+body { margin:0; padding:12px; background:var(--bg); color:var(--text);
+       font-family:-apple-system,'Segoe UI',Roboto,Arial,sans-serif; }
+.wrap { max-width:480px; margin:0 auto; }
+header { display:flex; align-items:center; justify-content:space-between;
+         margin-bottom:12px; gap:10px; }
+h1 { font-size:1.2rem; margin:0; color:var(--head); }
+.card { background:var(--card); border-radius:12px; padding:16px;
+        margin-bottom:12px; box-shadow:0 2px 8px rgba(0,0,0,.10); }
+label { display:block; font-weight:600; margin:10px 0 6px;
+        color:var(--head); }
+input[type=text], input[type=number] {
+  width:100%; padding:12px; font-size:16px; border:2px solid var(--line);
+  border-radius:10px; background:var(--card); color:var(--text); }
+.modes { display:flex; flex-direction:column; gap:8px; }
+.mode { display:flex; align-items:center; gap:10px;
+        border:2px solid var(--line); border-radius:10px;
+        padding:12px; min-height:48px; font-weight:600;
+        color:var(--text); margin:0; }
+.mode.sel { border-color:var(--btn); background:rgba(74,123,255,.10); }
+.mode input { accent-color:var(--btn); width:20px; height:20px; }
+.row { display:flex; gap:10px; align-items:center; margin-top:10px; }
+.row input { flex:1; min-width:0; }
+.seg { display:inline-flex; border:2px solid var(--line);
+       border-radius:10px; overflow:hidden; }
+.seg label { margin:0; padding:12px 16px; }
+.seg label.sel { background:var(--btn); color:#fff; }
+.seg input { display:none; }
+.seg.off { opacity:.4; pointer-events:none; }
+button { width:100%; padding:14px; font-size:17px; font-weight:700;
+         color:#fff; background:var(--btn); border:none;
+         border-radius:10px; margin-top:14px; min-height:48px; }
+button.small { width:auto; padding:8px 14px; font-size:14px; margin:0; }
+button:disabled { opacity:.5; }
+.tabs { display:flex; gap:8px; margin-bottom:12px; }
+.tabs button { margin:0; background:transparent; color:var(--head);
+               border-bottom:3px solid transparent; font-size:16px;
+               padding:12px 8px; box-shadow:none; }
+.tabs button.sel { border-bottom-color:var(--btn); }
+.park { display:flex; justify-content:space-between; align-items:center;
+        gap:8px; background:var(--chip); border-left:4px solid var(--ok);
+        border-radius:8px; padding:12px; margin:8px 0; }
+.park label.check { display:flex; align-items:center; gap:10px;
+                   margin:0; color:var(--text); font-weight:400;
+                   flex:1; min-width:0; }
+.park input[type=checkbox] { width:22px; height:22px; flex:none; }
+.ref { color:var(--head); font-weight:600; font-size:.85rem; }
+.dist { background:var(--btn); color:#fff; border-radius:16px;
+        padding:4px 10px; font-weight:600; white-space:nowrap; }
+.err { background:var(--warn); color:var(--warn-text);
+       border-left:4px solid #dc3545; border-radius:8px;
+       padding:12px; margin-top:10px; }
+a.maps { display:block; text-align:center; background:var(--ok);
+         color:#fff; text-decoration:none; border-radius:10px;
+         padding:14px; font-weight:700; margin-top:12px; }
+.hint { font-size:.85rem; opacity:.75; margin-top:6px; }
+.count { font-weight:700; margin:4px 0; }
+footer { text-align:center; margin:16px 0 8px; font-size:.9rem; }
+footer a { color:var(--head); }
+a.potalink { color:var(--head); text-decoration:none; }
+[hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>POTA Trip Planner</h1>
+  <button class="small" onclick="toggleDark()">Dark mode</button>
+</header>
+
+<div class="tabs">
+  <button id="tHome" class="sel" onclick="tab('home')">Home Trip</button>
+  <button id="tRoad" onclick="tab('road')">Road Trip</button>
+</div>
+
+<div id="pHome">
+  <div class="card">
+    <label for="mLoc">Location</label>
+    <input type="text" id="mLoc" placeholder="City, State, Country"
+           autocomplete="street-address">
+    <label>Trip limit - choose one</label>
+    <div class="modes" id="mModes">
+      <label class="mode sel"><input type="radio" name="mmode"
+        value="radius" checked> Radius (as the crow flies)</label>
+      <label class="mode"><input type="radio" name="mmode"
+        value="hours"> Driving time (round trip + activation)</label>
+      <label class="mode"><input type="radio" name="mmode"
+        value="distance"> Trip distance (round trip)</label>
+    </div>
+    <div class="row">
+      <input type="number" id="mVal" value="100" min="1" step="any"
+             aria-label="Constraint value">
+      <div class="seg" id="mUnits">
+        <label class="sel"><input type="radio" name="munit" value="mi"
+               checked>Mi</label>
+        <label><input type="radio" name="munit" value="km">Km</label>
+      </div>
+    </div>
+    <div id="mAct" hidden>
+      <label for="mActH">Hours per park</label>
+      <input type="number" id="mActH" value="2" min="0.5" max="12"
+             step="0.5">
+    </div>
+    <div class="hint" id="mHint"></div>
+    <button id="mPlanBtn" onclick="planHome()">Plan My Trip</button>
+  </div>
+  <div class="card" id="homeOut" hidden></div>
+</div>
+
+<div id="pRoad" hidden>
+  <div class="card">
+    <label for="mOrigin">Start from</label>
+    <input type="text" id="mOrigin" placeholder="e.g. Dallas, TX">
+    <label for="mDest">Driving to</label>
+    <input type="text" id="mDest" placeholder="e.g. Denver, CO">
+    <label for="mCorr">Corridor width</label>
+    <div class="row">
+      <input type="number" id="mCorr" value="25" min="1" step="any"
+             aria-label="Corridor width">
+      <div class="seg" id="rUnits">
+        <label class="sel"><input type="radio" name="runit" value="mi"
+               checked>Mi</label>
+        <label><input type="radio" name="runit" value="km">Km</label>
+      </div>
+    </div>
+    <button id="mRoadBtn" onclick="planRoad()">Find Parks Along Route</button>
+  </div>
+  <div class="card" id="roadOut" hidden></div>
+</div>
+
+<footer>
+  <a href="/">Full desktop version</a> &middot; v{{ version }}
+</footer>
+</div>
+
+<script>
+var MAX_STOPS = 10;
+var MODE_DEFAULTS = { radius:   { mi: 100, km: 160 },
+                     hours:    { mi: 4,   km: 4   },
+                     distance: { mi: 150, km: 240 } };
+var MODE_HINTS = {
+  radius: 'How far from your location to look for parks.',
+  hours: 'Time budget per park: round-trip driving (~40 mph) plus your activation stop.',
+  distance: 'Maximum round-trip driving distance per park.' };
+var roadParks = [];
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, function (c) {
+    return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;',
+             "'":'&#39;' }[c]; });
+}
+function toggleDark() {
+  document.body.classList.toggle('dark-mode');
+  localStorage.setItem('darkMode',
+      document.body.classList.contains('dark-mode'));
+}
+if (localStorage.getItem('darkMode') === 'true') {
+  document.body.classList.add('dark-mode');
+}
+function tab(t) {
+  document.getElementById('pHome').hidden = (t !== 'home');
+  document.getElementById('pRoad').hidden = (t !== 'road');
+  document.getElementById('tHome').classList.toggle('sel', t === 'home');
+  document.getElementById('tRoad').classList.toggle('sel', t === 'road');
+}
+function mMode() {
+  return document.querySelector('input[name="mmode"]:checked').value;
+}
+function mUnit() {
+  return document.querySelector('input[name="munit"]:checked').value;
+}
+function refreshMode() {
+  var mode = mMode(), unit = mUnit();
+  document.querySelectorAll('#mModes .mode').forEach(function (el) {
+    el.classList.toggle('sel', el.querySelector('input').checked);
+  });
+  document.querySelectorAll('#mUnits label').forEach(function (el) {
+    el.classList.toggle('sel', el.querySelector('input').checked);
+  });
+  var isHours = mode === 'hours';
+  document.getElementById('mUnits').classList.toggle('off', isHours);
+  document.getElementById('mAct').hidden = !isHours;
+  var v = document.getElementById('mVal');
+  v.value = MODE_DEFAULTS[mode][unit];
+  v.min = isHours ? '0.5' : '1';
+  v.step = isHours ? '0.5' : 'any';
+  document.getElementById('mHint').textContent = MODE_HINTS[mode];
+}
+document.querySelectorAll('input[name="mmode"], input[name="munit"]')
+    .forEach(function (el) { el.addEventListener('change', refreshMode); });
+refreshMode();
+
+function planHome() {
+  var btn = document.getElementById('mPlanBtn');
+  var out = document.getElementById('homeOut');
+  var loc = document.getElementById('mLoc').value.trim();
+  if (!loc) { showErr(out, 'Please enter a location.'); return; }
+  var body = { location: loc, mode: mMode(),
+               value: document.getElementById('mVal').value,
+               unit: mUnit() };
+  if (mMode() === 'hours') {
+    body.activation_hours =
+        document.getElementById('mActH').value;
+  }
+  btn.disabled = true; btn.textContent = 'Planning...';
+  fetch('/plan_trip', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body) })
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (d.error) { showErr(out, d.error); return; }
+      var h = '<div class="count">' + d.parkCount +
+              ' park' + (d.parkCount === 1 ? '' : 's') + ' near ' +
+              esc(d.location) + '</div>';
+      (d.parks || []).forEach(function (p, i) {
+        h += '<div class="park"><div><span class="ref">' +
+             (i + 1) + '. ' + esc(p.reference) + '</span><br>' +
+             esc(p.name) + '</div><span class="dist">' +
+             p.distance + ' mi</span></div>';
+      });
+      if (d.googleMapsUrl) {
+        h += '<a class="maps" href="' + esc(d.googleMapsUrl) +
+             '" target="_blank" rel="noopener">Open route in Google Maps</a>';
+      }
+      out.innerHTML = h; out.hidden = false; out.scrollIntoView();
+    })
+    .catch(function () { showErr(out, 'Network error. Please try again.'); })
+    .finally(function () {
+      btn.disabled = false; btn.textContent = 'Plan My Trip'; });
+}
+
+function planRoad() {
+  var btn = document.getElementById('mRoadBtn');
+  var out = document.getElementById('roadOut');
+  var o = document.getElementById('mOrigin').value.trim();
+  var d = document.getElementById('mDest').value.trim();
+  if (!o || !d) { showErr(out, 'Please fill in both origin and destination.'); return; }
+  var unit = document.querySelector('input[name="runit"]:checked').value;
+  document.querySelectorAll('#rUnits label').forEach(function (el) {
+    el.classList.toggle('sel', el.querySelector('input').checked);
+  });
+  btn.disabled = true; btn.textContent = 'Searching...';
+  fetch('/road_trip', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ origin: o, destination: d,
+          corridor: document.getElementById('mCorr').value,
+          unit: unit }) })
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      if (data.error) { showErr(out, data.error); return; }
+      roadParks = data.parks || [];
+      var h = '<div class="count">' + esc(data.origin) + ' -> ' +
+              esc(data.destination) + ': ' + data.routeDistanceMiles +
+              ' mi, about ' + data.routeDurationHours + ' h drive</div>' +
+              '<div class="hint">' + roadParks.length +
+              ' parks near the route. Pick up to ' + MAX_STOPS +
+              ' stops.</div>';
+      roadParks.forEach(function (p, i) {
+        h += '<div class="park"><label class="check">' +
+             '<input type="checkbox" data-idx="' + i + '"' +
+             (i < MAX_STOPS ? ' checked' : '') +
+             ' onchange="selChanged()">' +
+             '<span><span class="ref">' + esc(p.reference) +
+             '</span> ' + esc(p.name) +
+             '<br><a class="potalink" href="' + esc(p.potaUrl) +
+             '" target="_blank" rel="noopener">pota.app page</a></span>' +
+             '</label><span class="dist">' + p.off_route_miles +
+             ' mi off</span></div>';
+      });
+      h += '<div class="hint" id="selCount"></div>' +
+           '<button id="mBuildBtn" onclick="buildRoute()">' +
+           'Build Route with Selected Stops</button>' +
+           '<a class="maps" id="mMapsLink" hidden target="_blank" ' +
+           'rel="noopener"></a>';
+      out.innerHTML = h; out.hidden = false;
+      selChanged(); out.scrollIntoView();
+    })
+    .catch(function () { showErr(out, 'Network error. Please try again.'); })
+    .finally(function () {
+      btn.disabled = false; btn.textContent = 'Find Parks Along Route'; });
+}
+
+function picked() {
+  var list = [];
+  document.querySelectorAll('#roadOut input[type=checkbox]:checked')
+      .forEach(function (cb) { list.push(roadParks[+cb.dataset.idx]); });
+  return list;
+}
+function selChanged() {
+  var n = picked().length;
+  var c = document.getElementById('selCount');
+  var b = document.getElementById('mBuildBtn');
+  if (c) c.textContent = n + ' of ' + MAX_STOPS + ' stops selected';
+  if (b) b.disabled = (n === 0 || n > MAX_STOPS);
+}
+function buildRoute() {
+  var ps = picked();
+  if (ps.length === 0 || ps.length > MAX_STOPS) return;
+  var wpts = ps.map(function (p) {
+    return p.latitude + ',' + p.longitude; }).join('|');
+  var url = 'https://www.google.com/maps/dir/?api=1' +
+      '&origin=' + encodeURIComponent(
+          document.getElementById('mOrigin').value.trim()) +
+      '&destination=' + encodeURIComponent(
+          document.getElementById('mDest').value.trim()) +
+      '&waypoints=' + encodeURIComponent(wpts);
+  var a = document.getElementById('mMapsLink');
+  a.href = url; a.hidden = false;
+  a.textContent = 'View route on Google Maps (' + ps.length +
+      ' stop' + (ps.length === 1 ? '' : 's') + ')';
+  a.scrollIntoView();
+}
+function showErr(el, msg) {
+  el.innerHTML = '<div class="err">' + esc(msg) + '</div>';
+  el.hidden = false;
+}
+</script>
+</body>
+</html>
+'''
+
+
+@app.route('/m')
+@app.route('/phone')
+def phone():
+    return render_template_string(PHONE_TEMPLATE, version=APP_VERSION)
+
 
 @app.route('/')
 def index():

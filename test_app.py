@@ -847,3 +847,37 @@ class TestEmptyResultsAndErrors:
         parks = appmod.find_nearby_parks(bad, (21.31, -157.86),
                                         max_distance_miles=100)
         assert all(p["reference"] != "CA-2395" for p in parks)
+
+
+# ------------------------------------------- v2.0.5 dedicated phone page
+class TestPhonePage:
+    """v2.0.5: /m and /phone serve the phone-first template; the
+    desktop page links to it."""
+
+    def test_phone_page_renders(self, client):
+        r = client.get("/m")
+        assert r.status_code == 200
+        body = r.get_data(as_text=True)
+        assert "POTA Trip Planner" in body
+        assert "Plan My Trip" in body
+        assert 'name="viewport"' in body
+        assert appmod.APP_VERSION in body  # footer version stamp
+
+    def test_phone_alias(self, client):
+        r = client.get("/phone")
+        assert r.status_code == 200
+        assert r.get_data(as_text=True) == \
+            client.get("/m").get_data(as_text=True)
+
+    def test_phone_page_no_external_resources(self, client):
+        # CSP is default-src 'self': the phone template must not
+        # reference any external URLs in link/script/img tags.
+        body = client.get("/m").get_data(as_text=True)
+        import re
+        ext = re.findall(
+            r'<(?:link|script|img)[^>]+https?://', body)
+        assert ext == []
+
+    def test_desktop_links_to_phone(self, client):
+        body = client.get("/").get_data(as_text=True)
+        assert 'href="/m"' in body
