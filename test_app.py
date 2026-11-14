@@ -720,7 +720,7 @@ class TestConstraintModes:
         r, h, m, err = appmod.resolve_constraint(
             {"mode": "radius", "value": "160", "unit": "km"})
         assert err is None
-        assert abs(r - 160 * appmod.KM_PER_MILE) < 1e-6
+        assert abs(r - 160 / appmod.KM_PER_MILE) < 1e-6  # ~99.4 mi
 
     def test_radius_km_over_cap_rejected(self):
         # 1000 km = 621 mi > 500 mi cap
@@ -742,7 +742,7 @@ class TestConstraintModes:
         r, h, m, err = appmod.resolve_constraint(
             {"mode": "distance", "value": "300", "unit": "km"})
         assert err is None and m is not None
-        assert abs(m - 300 * appmod.KM_PER_MILE) < 1e-6
+        assert abs(m - 300 / appmod.KM_PER_MILE) < 1e-6  # ~186.4 mi
 
     def test_unknown_mode_rejected(self):
         r, h, m, err = appmod.resolve_constraint(
@@ -767,12 +767,12 @@ class TestConstraintModes:
         r, h, m, err = appmod.resolve_constraint(
             {"radius": "160", "miles": "320", "unit": "km"})
         assert err is None
-        assert abs(r - 160 * appmod.KM_PER_MILE) < 1e-6
-        assert abs(m - 320 * appmod.KM_PER_MILE) < 1e-6
+        assert abs(r - 160 / appmod.KM_PER_MILE) < 1e-6
+        assert abs(m - 320 / appmod.KM_PER_MILE) < 1e-6
 
     def test_to_miles_passthrough(self):
         assert appmod.to_miles(10, "mi") == 10
-        assert abs(appmod.to_miles(10, "km") - 16.09344) < 1e-6
+        assert abs(appmod.to_miles(10, "km") - 6.2137) < 1e-4
 
 
 class TestPlanTripNewAPI:

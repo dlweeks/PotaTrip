@@ -102,6 +102,14 @@
 #                    animations, 44px+ touch targets, dark mode
 #                    shared with the main page. Desktop '/' unchanged
 #                    except a "phone version" link in the header.
+# 2.0.6  2026-11-13  Kilometre bug fixes (Don's report):
+#                    (1) to_miles() multiplied by KM_PER_MILE instead
+#                    of dividing -- km mode reached ~2.6x too far
+#                    (160 km returned parks 257 mi away). Several
+#                    tests had the inverted math baked in; corrected.
+#                    (2) Road-trip unit toggle (desktop + phone) had
+#                    no change listener: the highlight stayed on Miles
+#                    after selecting Kilometers. Now updates live.
 # ---------------------------------------------------------------------------
 """
 POTA Trip Planner — Flask backend.
@@ -129,7 +137,7 @@ from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
 
 # ---------------------------------------------------------------- constants
-APP_VERSION = "2.0.5"             # keep in sync with VERSION HISTORY above
+APP_VERSION = "2.0.6"             # keep in sync with VERSION HISTORY above
 AVG_SPEED_MPH = 40.0          # assumed average driving speed
 ACTIVATION_HOURS = 2.0        # default time spent at the park activating
 MAX_ACTIVATION_HOURS = 12.0   # cap for user-supplied hours-per-park
@@ -340,7 +348,7 @@ KM_PER_MILE = 1.609344
 def to_miles(value, unit):
     """Convert a distance value in `unit` ('mi'|'km') to miles."""
     if unit == "km":
-        return value * KM_PER_MILE
+        return value / KM_PER_MILE
     return value
 
 
@@ -1819,6 +1827,17 @@ HTML_TEMPLATE = '''
         document.querySelectorAll('input[name="mode"], input[name="unit"]')
             .forEach(el => el.addEventListener('change', refreshModeUI));
         refreshModeUI();
+        // v2.0.6 fix: road-trip unit toggle had no change listener, so
+        // its highlight stayed on Miles after picking Kilometers (the
+        // radio value itself changed, only the marker was stuck).
+        document.querySelectorAll('input[name="road_unit"]')
+            .forEach(el => el.addEventListener('change', () => {
+                document.querySelectorAll(
+                    '#roadUnitToggle .unit-option')
+                    .forEach(opt => opt.classList.toggle(
+                        'selected',
+                        opt.querySelector('input').checked));
+            }));
 
         function fmtDistance(miles) {
             if (currentUnit() === 'km') {
@@ -2320,6 +2339,14 @@ function refreshMode() {
 document.querySelectorAll('input[name="mmode"], input[name="munit"]')
     .forEach(function (el) { el.addEventListener('change', refreshMode); });
 refreshMode();
+// v2.0.6 fix: road unit toggle highlight (was only updated on submit).
+document.querySelectorAll('input[name="runit"]').forEach(function (el) {
+    el.addEventListener('change', function () {
+        document.querySelectorAll('#rUnits label').forEach(function (l) {
+            l.classList.toggle('sel', l.querySelector('input').checked);
+        });
+    });
+});
 
 function planHome() {
   var btn = document.getElementById('mPlanBtn');
