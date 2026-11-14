@@ -881,3 +881,122 @@ class TestPhonePage:
     def test_desktop_links_to_phone(self, client):
         body = client.get("/").get_data(as_text=True)
         assert 'href="/m"' in body
+
+
+# ------------------------------------------- v3.0.0 SOTA support
+SOTA_FIXTURE = """SOTA Summits List (Date=14/11/2026)
+SummitCode,AssociationName,RegionName,SummitName,AltM,AltFt,GridRef1,GridRef2,Longitude,Latitude,Points,BonusPoints,ValidFrom,ValidTo,ActivationCount,ActivationDate,ActivationCall
+W5T/BG-001,"USA - Texas","Bullis Gap Mountains","River Benchmark",1200,3938,-102.8357,29.6336,-102.83570,29.63360,2,3,01/07/2010,31/12/2099,0,,
+W5T/XX-999,"USA - Texas","Expired Range","Old Gone Summit",900,2952,-96.60,29.60,-96.60000,29.60000,2,0,01/07/2010,01/01/2020,5,,
+W5T/NOC-000,"USA - Texas","No Coords","Lost Summit",500,1640,,,,,,,,,
+"""
+
+
+class TestSotaNormalize:
+    def test_normalizes_columns_and_drops_expired(self):
+        import io
+        raw = pd.read_csv(io.StringIO(SOTA_FIXTURE), skiprows=1)
+        df = appmod._normalize_sota_df(raw)
+        assert {"reference", "name", "active", "latitude",
+                "longitude", "program"} <= set(df.columns)
+        # expired (ValidTo 2020) and no-coords rows dropped
+        assert len(df) == 1
+        row = df.iloc[0]
+        assert row["reference"] == "W5T/BG-001"
+        assert row["program"] == "sota"
+        assert row["alt_ft"] == 3938
+        assert abs(row["latitude"] - 29.6336) < 1e-4
+
+    def test_missing_required_column_raises(self):
+        import io
+        raw = pd.read_csv(io.StringIO("a,b\n1,2\n"))
+        with pytest.raises(ValueError):
+            appmod._normalize_sota_df(raw)
+
+
+class TestProgramParameter:
+    def _patch_frames(self, monkeypatch):
+        pota = pd.DataFrame(
+            [("K5P", "Mid Park", 1, 29.80, -96.40)],
+            columns=["reference", "name", "active", "latitude", "longitude"])
+        sota = pd.DataFrame(
+            [("W5T/NEAR-1", "Route Summit", 1, 29.75, -97.20,
+              600, 1968, 5, 0, 3, "sota")],
+            columns=["reference", "name", "active", "latitude", "longitude",
+                     "alt_m", "alt_ft", "points", "bonus_points",
+                     "activation_count", "program"])
+        monkeypatch.setattr(appmod, "load_parks_from_cache", lambda: pota)
+        monkeypatch.setattr(appmod, "load_sota_from_cache", lambda: sota)
+
+    def test_both_mode_merges_with_program_tags(self, monkeypatch):
+        self._patch_frames(monkeypatch)
+        both = appmod.load_program_frames("both")
+        assert len(both) == 2
+        assert set(both["program"]) == {"pota", "sota"}
+        assert not both["program"].isna().any()
+
+    def test_pota_mode_tags_pota(self, monkeypatch):
+        self._patch_frames(monkeypatch)
+        df = appmod.load_program_frames("pota")
+        assert set(df["program"]) == {"pota"}
+
+    def test_unknown_program_raises(self):
+        with pytest.raises(ValueError):
+            appmod.load_program_frames("bogus")
+
+    def test_plan_trip_sota_endpoint(self, client, monkeypatch):
+        self._patch_frames(monkeypatch)
+        r = client.post("/plan_trip", json={
+            "location": "Eustace, TX", "mode": "radius",
+            "value": "500", "unit": "mi", "program": "sota"})
+        assert r.status_code == 200
+        body = r.get_json()
+        assert body["program"] == "sota"
+        assert body["parkCount"] == 1
+        p = body["parks"][0]
+        assert p["reference"] == "W5T/NEAR-1"
+        assert p["program"] == "sota"
+        assert p["alt_ft"] == 1968
+        assert p["summitUrl"].startswith("https://www.sota.org.uk/Summit/")
+
+    def test_plan_trip_both_endpoint(self, client, monkeypatch):
+        self._patch_frames(monkeypatch)
+        r = client.post("/plan_trip", json={
+            "location": "Eustace, TX", "mode": "radius",
+            "value": "500", "unit": "mi", "program": "both"})
+        assert r.status_code == 200
+        progs = {p["program"] for p in r.get_json()["parks"]}
+        assert progs == {"pota", "sota"}
+
+    def test_plan_trip_unknown_program_400(self, client):
+        r = client.post("/plan_trip", json={
+            "location": "Eustace, TX", "mode": "radius",
+            "value": "50", "program": "qrp"})
+        assert r.status_code == 400
+
+    def test_plan_trip_default_is_pota(self, client, monkeypatch):
+        self._patch_frames(monkeypatch)
+        r = client.post("/plan_trip", json={
+            "location": "Eustace, TX", "mode": "radius", "value": "500"})
+        assert r.status_code == 200
+        body = r.get_json()
+        assert body["program"] == "pota"
+        assert all(p["program"] == "pota" for p in body["parks"])
+
+    def test_road_trip_sota_endpoint(self, client, monkeypatch):
+        self._patch_frames(monkeypatch)
+        monkeypatch.setattr(
+            appmod, "fetch_driving_route",
+            lambda a, b: {"coords": [a,
+                                    ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2),
+                                    b],
+                         "distance_miles": 100.0, "duration_hours": 2.5})
+        r = client.post("/road_trip", json={
+            "origin": "Eustace, TX", "destination": "Houston, TX",
+            "corridor": "100", "unit": "mi", "program": "sota"})
+        assert r.status_code == 200
+        body = r.get_json()
+        assert body["program"] == "sota"
+        assert body["parkCount"] >= 1
+        assert body["parks"][0]["program"] == "sota"
+        assert "sota.org.uk" in body["parks"][0]["potaUrl"]

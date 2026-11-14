@@ -110,6 +110,18 @@
 #                    (2) Road-trip unit toggle (desktop + phone) had
 #                    no change listener: the highlight stayed on Miles
 #                    after selecting Kilometers. Now updates live.
+# 3.0.0  2026-11-14  SOTA (Summits on the Air) support. New program
+#                    selector (POTA / SOTA / Both) on desktop and
+#                    phone pages. SOTA summits load from the official
+#                    daily CSV (storage.sota.org.uk/summitslist.csv,
+#                    ~182k summits) into a normalized cache matching
+#                    the POTA frame shape; expired summits dropped.
+#                    /plan_trip and /road_trip accept program=pota|
+#                    sota|both (default pota, fully backward
+#                    compatible). SOTA results carry elevation,
+#                    points and a link to the official summit page;
+#                    Both mode merges, sorts by distance, badges each
+#                    row. /health reports sota_cache_valid.
 # ---------------------------------------------------------------------------
 """
 POTA Trip Planner — Flask backend.
@@ -137,7 +149,7 @@ from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
 
 # ---------------------------------------------------------------- constants
-APP_VERSION = "2.0.6"             # keep in sync with VERSION HISTORY above
+APP_VERSION = "3.0.0"             # keep in sync with VERSION HISTORY above
 AVG_SPEED_MPH = 40.0          # assumed average driving speed
 ACTIVATION_HOURS = 2.0        # default time spent at the park activating
 MAX_ACTIVATION_HOURS = 12.0   # cap for user-supplied hours-per-park
@@ -145,6 +157,10 @@ CACHE_MAX_AGE_DAYS = 7
 DEFAULT_RADIUS_MILES = 100.0
 MAX_MAP_WAYPOINTS = 10        # parks included in the Google Maps route
 POTA_CSV_URL = "https://pota.app/all_parks_ext.csv"
+# v3.0.0: SOTA (Summits on the Air) support. Worldwide summits list,
+# refreshed daily by the SOTA admin team. First line is a title row.
+SOTA_CSV_URL = "https://storage.sota.org.uk/summitslist.csv"
+VALID_PROGRAMS = ("pota", "sota", "both")
 
 # Security limits (see VERSION HISTORY 1.7.0).
 MAX_RADIUS_MILES = 500.0      # beyond this the whole-planet scan is a DoS
@@ -174,6 +190,8 @@ _USER_CACHE_DIR = os.path.join(
 os.makedirs(_USER_CACHE_DIR, exist_ok=True)
 CACHE_FILE = os.environ.get(
     "POTA_CACHE_FILE", os.path.join(_USER_CACHE_DIR, "all_parks_ext.csv"))
+SOTA_CACHE_FILE = os.environ.get(
+    "POTA_SOTA_CACHE_FILE", os.path.join(_USER_CACHE_DIR, "sota_summits.csv"))
 LOG_FILE = os.environ.get(
     "POTA_LOG_FILE", os.path.join(_USER_CACHE_DIR, "pota_trip_log.txt"))
 NOMINATIM_UA = os.environ.get(
@@ -195,6 +213,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 _cache_lock = threading.Lock()
+_sota_cache_lock = threading.Lock()
 _geocode_cache = {}
 
 
@@ -502,6 +521,150 @@ def load_parks_from_cache():
         except Exception as e2:
             logger.exception("Error loading stale cache: %s", e2)
         return pd.DataFrame()
+
+
+# ------------------------------------------------------- SOTA summits (v3.0.0)
+def _parse_sota_date(s):
+    """Parse SOTA DD/MM/YYYY dates; returns None on garbage/blank."""
+    try:
+        return datetime.strptime(str(s).strip(), "%d/%m/%Y")
+    except (ValueError, TypeError):
+        return None
+
+
+def _sota_num(raw, col):
+    """Numeric column from the raw SOTA frame, NaN when the column is absent."""
+    if col in raw.columns:
+        return pd.to_numeric(raw[col], errors="coerce")
+    return pd.Series(float("nan"), index=raw.index)
+
+
+def _normalize_sota_df(raw):
+    """Normalize the raw SOTA summits CSV into POTATrip's internal shape.
+
+    Output columns match the POTA frame (reference, name, active,
+    latitude, longitude) plus SOTA extras (alt_m, alt_ft, points,
+    bonus_points, activation_count, program='sota'). Summits whose
+    ValidTo date has passed are dropped; blank/garbage dates are kept
+    (fail-open: a parse quirk must not silently delete valid summits).
+    """
+    for col in ("SummitCode", "SummitName", "Latitude", "Longitude"):
+        if col not in raw.columns:
+            raise ValueError(f"SOTA CSV missing required column '{col}'")
+    today = datetime.now()
+    keep = pd.Series(True, index=raw.index)
+    if "ValidTo" in raw.columns:
+        valid_to = raw["ValidTo"].map(_parse_sota_date)
+        keep &= valid_to.isna() | (valid_to >= today)
+    if "ValidFrom" in raw.columns:
+        valid_from = raw["ValidFrom"].map(_parse_sota_date)
+        keep &= valid_from.isna() | (valid_from <= today)
+    out = pd.DataFrame({
+        "reference": raw["SummitCode"].astype(str).str.strip(),
+        "name": raw["SummitName"].astype(str).str.strip(),
+        "latitude": pd.to_numeric(raw["Latitude"], errors="coerce"),
+        "longitude": pd.to_numeric(raw["Longitude"], errors="coerce"),
+        "alt_m": _sota_num(raw, "AltM"),
+        "alt_ft": _sota_num(raw, "AltFt"),
+        "points": _sota_num(raw, "Points").fillna(0).astype(int),
+        "bonus_points": _sota_num(raw, "BonusPoints").fillna(0).astype(int),
+        "activation_count": _sota_num(raw, "ActivationCount")
+                            .fillna(0).astype(int),
+        "active": 1,
+        "program": "sota",
+    })
+    out = out[keep.values]
+    out = out.dropna(subset=["latitude", "longitude"])
+    return out.reset_index(drop=True)
+
+
+def _download_sota():
+    """Download the worldwide SOTA summits list (title row skipped)."""
+    resp = requests.get(SOTA_CSV_URL, timeout=60)
+    resp.raise_for_status()
+    raw = pd.read_csv(io.StringIO(resp.text), skiprows=1)
+    if "SummitCode" not in raw.columns:
+        raise ValueError("Downloaded CSV is not the SOTA summits file "
+                        "(missing 'SummitCode' column)")
+    return _normalize_sota_df(raw)
+
+
+def _is_fresh(path):
+    """True if `path` exists and is younger than CACHE_MAX_AGE_DAYS."""
+    if not os.path.exists(path):
+        return False
+    mod = datetime.fromtimestamp(os.path.getmtime(path))
+    return mod > datetime.now() - timedelta(days=CACHE_MAX_AGE_DAYS)
+
+
+def load_sota_from_cache():
+    """Load normalized SOTA summits, downloading fresh data when stale.
+
+    Mirrors load_parks_from_cache: fresh cache -> read; else download
+    under lock; on failure fall back to the stale file; empty frame if
+    all else fails (callers degrade the program, never crash).
+    """
+    try:
+        if _is_fresh(SOTA_CACHE_FILE):
+            df = pd.read_csv(SOTA_CACHE_FILE)
+            logger.info("Loaded %d SOTA summits from cache", len(df))
+            return df
+        with _sota_cache_lock:
+            if _is_fresh(SOTA_CACHE_FILE):
+                df = pd.read_csv(SOTA_CACHE_FILE)
+            else:
+                logger.info("SOTA cache stale/missing -- downloading...")
+                df = _download_sota()
+                _atomic_to_csv(df, SOTA_CACHE_FILE)
+                logger.info("Downloaded and cached %d SOTA summits", len(df))
+        return df
+    except Exception as e:
+        logger.exception("Error refreshing SOTA data: %s", e)
+        try:
+            if os.path.exists(SOTA_CACHE_FILE):
+                df = pd.read_csv(SOTA_CACHE_FILE)
+                logger.info("Loaded %d SOTA summits from stale cache",
+                           len(df))
+                return df
+        except Exception as e2:
+            logger.exception("Error loading stale SOTA cache: %s", e2)
+        return pd.DataFrame()
+
+
+def _with_program(df, prog):
+    """Ensure the frame carries a non-null 'program' column."""
+    if df is None or len(df) == 0:
+        return df if df is not None else pd.DataFrame()
+    if "program" not in df.columns:
+        df = df.copy()
+    df["program"] = prog
+    return df
+
+
+def load_program_frames(program):
+    """Combined DataFrame for the requested program.
+
+    'pota' / 'sota' return that dataset alone; 'both' concatenates
+    them (the 'program' column distinguishes rows). Raises ValueError
+    for unknown programs (callers map to 400). Every returned row has
+    a non-null 'program' value -- NaN would leak into JSON responses.
+    """
+    program = (program or "pota").strip().lower()
+    if program not in VALID_PROGRAMS:
+        raise ValueError(f"Unknown program '{program}' "
+                       f"(use pota, sota, or both).")
+    if program == "pota":
+        return _with_program(load_parks_from_cache(), "pota")
+    if program == "sota":
+        return load_sota_from_cache()
+    frames = [_with_program(f, "pota") if f is not None and "program" not in f.columns else f
+              for f in (load_parks_from_cache(), load_sota_from_cache())
+              if f is not None and not f.empty]
+    if not frames:
+        return pd.DataFrame()
+    combined = pd.concat(frames, ignore_index=True)
+    combined = combined.drop_duplicates(subset=["reference"], keep="first")
+    return combined
 
 
 # ---------------------------------------------------------------- geocoding
@@ -1198,6 +1361,24 @@ HTML_TEMPLATE = '''
             pointer-events: none;
         }
 
+        /* v3.0.0: program badges (POTA / SOTA) on result rows */
+        .prog-badge {
+            display: inline-block;
+            padding: 1px 7px;
+            border-radius: 8px;
+            font-size: 0.72em;
+            font-weight: 700;
+            vertical-align: middle;
+        }
+        .prog-pota {
+            background: rgba(74, 123, 240, .16);
+            color: #4a7cf0;
+        }
+        .prog-sota {
+            background: rgba(46, 160, 67, .16);
+            color: #2ea043;
+        }
+
         .hint {
             display: block;
             margin-top: 6px;
@@ -1680,6 +1861,27 @@ HTML_TEMPLATE = '''
                         activating (default 2h). Included in your time
                         budget per park.</small>
                 </div>
+
+                <div class="form-group">
+                    <label>Program:</label>
+                    <div class="unit-toggle" id="homeProgToggle"
+                         role="radiogroup" aria-label="Activation program">
+                        <label class="unit-option selected">
+                            <input type="radio" name="program" value="pota"
+                                   checked> POTA
+                        </label>
+                        <label class="unit-option">
+                            <input type="radio" name="program" value="sota">
+                            SOTA
+                        </label>
+                        <label class="unit-option">
+                            <input type="radio" name="program" value="both">
+                            Both
+                        </label>
+                    </div>
+                    <small class="hint">Parks on the Air, Summits on the
+                        Air, or both programs together.</small>
+                </div>
                 
                 <button type="submit">Plan My Trip</button>
             </form>
@@ -1729,6 +1931,26 @@ HTML_TEMPLATE = '''
                         <small class="hint">Parks within this distance of the
                             driving route are added as stops (max 10 stops —
                             Google Maps waypoint limit).</small>
+                    </div>
+                    <div class="form-group">
+                        <label>Program:</label>
+                        <div class="unit-toggle" id="roadProgToggle"
+                             role="radiogroup" aria-label="Activation program">
+                            <label class="unit-option selected">
+                                <input type="radio" name="road_program"
+                                       value="pota" checked> POTA
+                            </label>
+                            <label class="unit-option">
+                                <input type="radio" name="road_program"
+                                       value="sota"> SOTA
+                            </label>
+                            <label class="unit-option">
+                                <input type="radio" name="road_program"
+                                       value="both"> Both
+                            </label>
+                        </div>
+                        <small class="hint">Parks on the Air, Summits on the
+                            Air, or both programs together.</small>
                     </div>
                     <button type="submit">Find Parks Along the Route</button>
                 </form>
@@ -1838,6 +2060,16 @@ HTML_TEMPLATE = '''
                         'selected',
                         opt.querySelector('input').checked));
             }));
+        // v3.0.0: program selector highlight (POTA / SOTA / Both).
+        document.querySelectorAll(
+            'input[name="program"], input[name="road_program"]')
+            .forEach(el => el.addEventListener('change', () => {
+                const group = el.closest('.unit-toggle');
+                if (!group) return;
+                group.querySelectorAll('.unit-option').forEach(opt =>
+                    opt.classList.toggle('selected',
+                        opt.querySelector('input').checked));
+            }));
 
         function fmtDistance(miles) {
             if (currentUnit() === 'km') {
@@ -1906,13 +2138,31 @@ HTML_TEMPLATE = '''
                     resultCity.textContent = data.location || data.city;
                     let parksHTML = '<div class="park-list">';
                     body.parks.forEach((park, index) => {
+                        const isSota = park.program === 'sota';
+                        const badge = isSota
+                            ? '<span class="prog-badge prog-sota">SOTA</span>'
+                            : '<span class="prog-badge prog-pota">POTA</span>';
+                        let sotaExtra = '';
+                        if (isSota) {
+                            sotaExtra =
+                                ' &nbsp;·&nbsp; '
+                                + Number(park.alt_ft || 0).toLocaleString()
+                                + ' ft'
+                                + ' &nbsp;·&nbsp; ' + (park.points || 0)
+                                + ' pts'
+                                + ' &nbsp;·&nbsp; <a href="'
+                                + esc(park.summitUrl)
+                                + '" target="_blank"'
+                                + ' rel="noopener noreferrer">summit page</a>';
+                        }
                         parksHTML += `
                             <div class="park-item">
                                 <div class="park-info">
                                     <span class="park-number-marker">${index + 1}</span>
+                                    ${badge}
                                     <span class="park-name">${esc(park.name)}</span>
                                     <br>
-                                    <span class="park-reference">${esc(park.reference)}</span>
+                                    <span class="park-reference">${esc(park.reference)}</span>${sotaExtra}
                                 </div>
                                 <div class="park-distance">${fmtDistance(park.distance)}</div>
                             </div>
@@ -1981,6 +2231,9 @@ HTML_TEMPLATE = '''
             // Rename road_unit -> unit for the API.
             if (data.road_unit) { data.unit = data.road_unit; }
             delete data.road_unit;
+            // Rename road_program -> program for the API.
+            if (data.road_program) { data.program = data.road_program; }
+            delete data.road_program;
 
             const submitButton = this.querySelector('button');
             const originalText = submitButton.textContent;
@@ -2033,6 +2286,17 @@ HTML_TEMPLATE = '''
                         `Tick the ones you want as stops (max ${MAX_STOPS}).`;
                     let html = '<div class="park-list">';
                     body.parks.forEach((park, index) => {
+                        const isSota = park.program === 'sota';
+                        const badge = isSota
+                            ? '<span class="prog-badge prog-sota">SOTA</span>'
+                            : '<span class="prog-badge prog-pota">POTA</span>';
+                        const linkLabel = isSota ? 'summit page'
+                                               : 'POTA page';
+                        const elev = isSota
+                            ? ' &nbsp;·&nbsp; '
+                              + Number(park.alt_ft || 0).toLocaleString()
+                              + ' ft'
+                            : '';
                         html += `
                             <div class="park-item">
                                 <label class="park-select">
@@ -2041,13 +2305,14 @@ HTML_TEMPLATE = '''
                                            onchange="updateSelectionCount()">
                                 </label>
                                 <div class="park-info">
+                                    ${badge}
                                     <span class="park-name">${esc(park.name)}</span>
                                     <br>
-                                    <span class="park-reference">${esc(park.reference)}</span>
+                                    <span class="park-reference">${esc(park.reference)}</span>${elev}
                                     &nbsp;·&nbsp;
                                     <a href="${esc(park.potaUrl)}"
                                        target="_blank"
-                                       rel="noopener noreferrer">POTA page</a>
+                                       rel="noopener noreferrer">${linkLabel}</a>
                                 </div>
                                 <div class="park-distance">${fmtRoadDist(park.off_route_miles)} off route</div>
                             </div>
@@ -2208,6 +2473,10 @@ a.maps { display:block; text-align:center; background:var(--ok);
 footer { text-align:center; margin:16px 0 8px; font-size:.9rem; }
 footer a { color:var(--head); }
 a.potalink { color:var(--head); text-decoration:none; }
+.pbadge { display:inline-block; padding:1px 7px; border-radius:8px;
+          font-size:.7rem; font-weight:700; vertical-align:middle; }
+.pbadge.pota { background:rgba(44,90,160,.15); color:var(--head); }
+.pbadge.sota { background:rgba(40,167,69,.18); color:var(--ok); }
 [hidden] { display:none !important; }
 </style>
 </head>
@@ -2252,6 +2521,13 @@ a.potalink { color:var(--head); text-decoration:none; }
              step="0.5">
     </div>
     <div class="hint" id="mHint"></div>
+    <label>Program</label>
+    <div class="seg" id="mProg">
+      <label class="sel"><input type="radio" name="mprog" value="pota"
+             checked>POTA</label>
+      <label><input type="radio" name="mprog" value="sota">SOTA</label>
+      <label><input type="radio" name="mprog" value="both">Both</label>
+    </div>
     <button id="mPlanBtn" onclick="planHome()">Plan My Trip</button>
   </div>
   <div class="card" id="homeOut" hidden></div>
@@ -2272,6 +2548,13 @@ a.potalink { color:var(--head); text-decoration:none; }
                checked>Mi</label>
         <label><input type="radio" name="runit" value="km">Km</label>
       </div>
+    </div>
+    <label>Program</label>
+    <div class="seg" id="rProg">
+      <label class="sel"><input type="radio" name="rprog" value="pota"
+             checked>POTA</label>
+      <label><input type="radio" name="rprog" value="sota">SOTA</label>
+      <label><input type="radio" name="rprog" value="both">Both</label>
     </div>
     <button id="mRoadBtn" onclick="planRoad()">Find Parks Along Route</button>
   </div>
@@ -2347,6 +2630,32 @@ document.querySelectorAll('input[name="runit"]').forEach(function (el) {
         });
     });
 });
+// v3.0.0: program segment accessors + highlight.
+function mProg() {
+  return document.querySelector('input[name="mprog"]:checked').value;
+}
+function rProg() {
+  return document.querySelector('input[name="rprog"]:checked').value;
+}
+function progBadge(p) {
+  return p.program === 'sota'
+      ? '<span class="pbadge sota">SOTA</span> '
+      : '<span class="pbadge pota">POTA</span> ';
+}
+document.querySelectorAll('input[name="mprog"]').forEach(function (el) {
+    el.addEventListener('change', function () {
+        document.querySelectorAll('#mProg label').forEach(function (l) {
+            l.classList.toggle('sel', l.querySelector('input').checked);
+        });
+    });
+});
+document.querySelectorAll('input[name="rprog"]').forEach(function (el) {
+    el.addEventListener('change', function () {
+        document.querySelectorAll('#rProg label').forEach(function (l) {
+            l.classList.toggle('sel', l.querySelector('input').checked);
+        });
+    });
+});
 
 function planHome() {
   var btn = document.getElementById('mPlanBtn');
@@ -2355,7 +2664,7 @@ function planHome() {
   if (!loc) { showErr(out, 'Please enter a location.'); return; }
   var body = { location: loc, mode: mMode(),
                value: document.getElementById('mVal').value,
-               unit: mUnit() };
+               unit: mUnit(), program: mProg() };
   if (mMode() === 'hours') {
     body.activation_hours =
         document.getElementById('mActH').value;
@@ -2371,9 +2680,13 @@ function planHome() {
               ' park' + (d.parkCount === 1 ? '' : 's') + ' near ' +
               esc(d.location) + '</div>';
       (d.parks || []).forEach(function (p, i) {
-        h += '<div class="park"><div><span class="ref">' +
+        var extra = p.program === 'sota'
+            ? ' · ' + Number(p.alt_ft || 0).toLocaleString() + ' ft · '
+              + (p.points || 0) + ' pts'
+            : '';
+        h += '<div class="park"><div>' + progBadge(p) + '<span class="ref">' +
              (i + 1) + '. ' + esc(p.reference) + '</span><br>' +
-             esc(p.name) + '</div><span class="dist">' +
+             esc(p.name) + extra + '</div><span class="dist">' +
              p.distance + ' mi</span></div>';
       });
       if (d.googleMapsUrl) {
@@ -2402,7 +2715,7 @@ function planRoad() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ origin: o, destination: d,
           corridor: document.getElementById('mCorr').value,
-          unit: unit }) })
+          unit: unit, program: rProg() }) })
     .then(function (r) { return r.json(); })
     .then(function (data) {
       if (data.error) { showErr(out, data.error); return; }
@@ -2414,14 +2727,19 @@ function planRoad() {
               ' parks near the route. Pick up to ' + MAX_STOPS +
               ' stops.</div>';
       roadParks.forEach(function (p, i) {
+        var linkLabel = p.program === 'sota' ? 'summit page'
+                                          : 'pota.app page';
+        var extra = p.program === 'sota'
+            ? ' · ' + Number(p.alt_ft || 0).toLocaleString() + ' ft'
+            : '';
         h += '<div class="park"><label class="check">' +
              '<input type="checkbox" data-idx="' + i + '"' +
              (i < MAX_STOPS ? ' checked' : '') +
              ' onchange="selChanged()">' +
-             '<span><span class="ref">' + esc(p.reference) +
-             '</span> ' + esc(p.name) +
+             '<span>' + progBadge(p) + '<span class="ref">' + esc(p.reference) +
+             '</span> ' + esc(p.name) + extra +
              '<br><a class="potalink" href="' + esc(p.potaUrl) +
-             '" target="_blank" rel="noopener">pota.app page</a></span>' +
+             '" target="_blank" rel="noopener">' + linkLabel + '</a></span>' +
              '</label><span class="dist">' + p.off_route_miles +
              ' mi off</span></div>';
       });
@@ -2493,7 +2811,8 @@ def index():
 def health():
     return jsonify({'status': 'ok',
                    'version': APP_VERSION,
-                   'cache_valid': is_cache_valid()})
+                   'cache_valid': is_cache_valid(),
+                   'sota_cache_valid': _is_fresh(SOTA_CACHE_FILE)})
 
 
 @app.after_request
@@ -2550,6 +2869,11 @@ def plan_trip():
             return jsonify({'error': err}), 400
         activation_hours = data.get("_activation_hours", ACTIVATION_HOURS)
 
+        program = (data.get("program") or "pota").strip().lower()
+        if program not in VALID_PROGRAMS:
+            return jsonify({'error': f"Unknown program '{program}' "
+                                    "(use pota, sota, or both)."}), 400
+
         if radius_value is None and hours_value is None and miles_value is None:
             return jsonify({'error': 'Please provide a trip constraint '\
                                     '(radius, driving hours, or trip '\
@@ -2557,10 +2881,11 @@ def plan_trip():
         if radius_value is None:
             radius_value = DEFAULT_RADIUS_MILES
 
-        logger.info("Planning trip for %s: radius=%s hours=%s miles=%s",
-                    location, radius_value, hours_value, miles_value)
+        logger.info("Planning trip for %s: radius=%s hours=%s miles=%s "
+                    "program=%s",
+                    location, radius_value, hours_value, miles_value, program)
 
-        parks_df = load_parks_from_cache()
+        parks_df = load_program_frames(program)
         if parks_df.empty:
             return jsonify({'error': 'Could not load park data. '
                                     'Please try again later.'}), 500
@@ -2589,15 +2914,27 @@ def plan_trip():
             if optimized:
                 nearby_parks = optimized
 
-        parks_data = [{
-            'name': park.get('name', 'Unnamed Park'),
-            'reference': park.get('reference', 'Unknown'),
-            'distance': round(park.get('distance_miles', 0.0), 2),
-        } for park in nearby_parks]
+        parks_data = []
+        for park in nearby_parks:
+            prog = park.get("program", "pota")
+            entry = {
+                'name': park.get('name', 'Unnamed Park'),
+                'reference': park.get('reference', 'Unknown'),
+                'distance': round(park.get('distance_miles', 0.0), 2),
+                'program': prog,
+            }
+            if prog == "sota":
+                entry['alt_ft'] = int(park.get('alt_ft') or 0)
+                entry['alt_m'] = int(park.get('alt_m') or 0)
+                entry['points'] = int(park.get('points') or 0)
+                entry['summitUrl'] = ("https://www.sota.org.uk/Summit/"
+                                     + str(entry['reference']))
+            parks_data.append(entry)
 
         response_data = {
             'city': location,          # legacy key: full location string
             'location': location,
+            'program': program,
             'parkCount': len(parks_data),
             'parks': parks_data,
             'googleMapsUrl': generate_google_maps_url_with_markers(location,
@@ -2643,12 +2980,17 @@ def road_trip():
         unit = (data.get('unit') or 'mi').strip().lower()
         if unit not in ("mi", "km"):
             return jsonify({'error': "Unknown unit (use 'mi' or 'km')."}), 400
+
+        program = (data.get('program') or 'pota').strip().lower()
+        if program not in VALID_PROGRAMS:
+            return jsonify({'error': f"Unknown program '{program}' "
+                                    "(use pota, sota, or both)."}), 400
         corridor = parse_positive_float(
             to_miles_arg(data.get('corridor'), unit), MAX_CORRIDOR_MILES)
         if corridor is None:
             corridor = DEFAULT_CORRIDOR_MILES
 
-        parks_df = load_parks_from_cache()
+        parks_df = load_program_frames(program)
         if parks_df.empty:
             return jsonify({'error': 'Could not load park data. '
                                     'Please try again later.'}), 500
@@ -2673,22 +3015,36 @@ def road_trip():
 
         parks = parks_along_route(parks_df, route['coords'],
                                  corridor_miles=corridor)
-        parks_data = [{
-            'name': p.get('name', 'Unnamed Park'),
-            'reference': p.get('reference', 'Unknown'),
-            'off_route_miles': round(p['off_route_miles'], 1),
-            'progress': round(p['progress'], 3),
-            'latitude': round(p['latitude'], 6),
-            'longitude': round(p['longitude'], 6),
-            # Deterministic POTA park page (contains the park's website,
-            # activator log, and details). No preprocessing needed.
-            'potaUrl': ("https://pota.app/#/park/"
-                       + str(p.get('reference', ''))),
-        } for p in parks[:ROAD_TRIP_CANDIDATES]]
+        parks_data = []
+        for p in parks[:ROAD_TRIP_CANDIDATES]:
+            prog = p.get("program", "pota")
+            entry = {
+                'name': p.get('name', 'Unnamed Park'),
+                'reference': p.get('reference', 'Unknown'),
+                'off_route_miles': round(p['off_route_miles'], 1),
+                'progress': round(p['progress'], 3),
+                'latitude': round(p['latitude'], 6),
+                'longitude': round(p['longitude'], 6),
+                'program': prog,
+            }
+            if prog == "sota":
+                entry['alt_ft'] = int(p.get('alt_ft') or 0)
+                entry['alt_m'] = int(p.get('alt_m') or 0)
+                entry['points'] = int(p.get('points') or 0)
+                # Reference page: the official SOTA summit page.
+                entry['potaUrl'] = ("https://www.sota.org.uk/Summit/"
+                                   + str(entry['reference']))
+            else:
+                # Deterministic POTA park page (contains the park's
+                # website, activator log, and details).
+                entry['potaUrl'] = ("https://pota.app/#/park/"
+                                   + str(entry['reference']))
+            parks_data.append(entry)
 
         response_data = {
             'origin': origin,
             'destination': destination,
+            'program': program,
             'routeDistanceMiles': round(route['distance_miles'], 1),
             'routeDurationHours': round(route['duration_hours'], 1),
             'corridorMiles': corridor,
@@ -2710,6 +3066,8 @@ if __name__ == '__main__':
     logger.info("Initializing POTA Trip Planner...")
     parks_df = load_parks_from_cache()
     logger.info("Loaded %d active parks", len(parks_df))
+    sota_df = load_sota_from_cache()
+    logger.info("Loaded %d valid SOTA summits", len(sota_df))
     host = os.environ.get("POTA_HOST", "127.0.0.1")
     port = int(os.environ.get("POTA_PORT", "5001"))
     debug = os.environ.get("POTA_DEBUG", "0") == "1"
